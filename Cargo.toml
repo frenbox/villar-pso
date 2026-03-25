@@ -1,0 +1,20 @@
+[package]
+name = "villar-pso"
+version = "0.1.0"
+edition = "2021"
+description = "Joint two-band Villar light-curve fitter using PSO — matches JAX fit_jax_best.py"
+default-run = "villar-pso"
+
+[lib]
+name = "villar_pso"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["python"]
+python = ["pyo3"]
+
+[dependencies]
+csv = "1.3"
+pyo3 = { version = "0.24", features = ["extension-module"], optional = true }
+rand = "0.9"
+serde = { version = "1.0", features = ["derive"] }
