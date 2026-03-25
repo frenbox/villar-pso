@@ -25,6 +25,8 @@ fn run_single(csv_path: &str, n_particles: usize, max_iters: usize, stall_iters:
         ..PsoConfig::default()
     };
 
+    let band_indices = BandIndices::new(&data.obs, data.orig_size);
+
     let mut best_params = [0.0; N_PARAMS];
     let mut best_cost = f64::INFINITY;
     let mut first_cost = f64::INFINITY;
@@ -35,7 +37,7 @@ fn run_single(csv_path: &str, n_particles: usize, max_iters: usize, stall_iters:
             break;
         }
         let cost_fn = |raw: &[f64; N_PARAMS]| {
-            pso_cost(raw, &data.obs, &param_map, data.orig_size, &priors, 0.0)
+            pso_cost(raw, &data.obs, &param_map, data.orig_size, &priors, 0.0, &band_indices)
         };
         let (params, cost) = pso_minimize(&cost_fn, &lower, &upper, &priors, &config, seed);
         if i == 0 { first_cost = cost; }

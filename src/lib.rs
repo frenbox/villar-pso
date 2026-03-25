@@ -8,6 +8,9 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use std::collections::HashMap;
 
+#[cfg(feature = "cuda")]
+pub mod gpu;
+
 // ─── Prior tables (from fit_jax_best.py) ─────────────────────────────────────
 // Each entry: (min, max, mean, std, logged)
 // logged = true → parameter lives in log10 space; 10^x applied after sampling.
@@ -29,25 +32,38 @@ pub const N_PARAMS: usize = 14; // 7 r + 7 g
 pub const FILTERS: [&str; 2] = ["ZTF_r", "ZTF_g"];
 
 // (min, max, mean, std, logged)
+// JAX-calibrated priors: ranges and means from fit_jax_best.py on reference sources.
+// log10 ranges include ~2 sigma margin beyond observed JAX fits.
 const PRIOR_R: [(f64, f64, f64, f64, bool); 7] = [
-    (-0.30, 0.50, 0.0957, 0.150, true),   // A
-    (-0.01, 0.03, 0.00833, 0.012, false),  // beta
-    (0.00, 3.50, 1.4258, 0.900, true),     // gamma
-    (-100.0, 30.0, -17.878, 30.000, false), // t_0
-    (-2.00, 4.00, 0.6664, 1.200, true),    // tau_rise
-    (0.00, 4.00, 1.5261, 0.900, true),     // tau_fall
-    (-3.00, -0.80, -1.6629, 0.900, true),  // extra_sigma
+    // A:  JAX log10 range [-0.04, 0.01], mean -0.009
+    (-0.20, 0.15, -0.009, 0.100, true),    // A  (phys 0.63–1.41)
+    (-0.01, 0.03, 0.009, 0.010, false),    // beta
+    // gamma: JAX log10 range [1.21, 1.60], mean 1.33
+    (0.80, 2.00, 1.327, 0.400, true),      // gamma (phys 6.3–100)
+    (-50.0, 30.0, -12.0, 15.000, false),   // t_0
+    // tau_rise: JAX log10 range [0.17, 0.49], mean 0.36
+    (-0.30, 1.00, 0.360, 0.350, true),     // tau_rise (phys 0.5–10)
+    // tau_fall: JAX log10 range [1.17, 1.87], mean 1.45
+    (0.80, 2.20, 1.454, 0.400, true),      // tau_fall (phys 6.3–158)
+    (-2.50, -0.30, -1.033, 0.500, true),   // extra_sigma
 ];
 
-// g-band: relative offsets from r-band
+// g-band: relative offsets from r-band.
+// JAX-calibrated from observed offset distributions.
 const PRIOR_G: [(f64, f64, f64, f64, bool); 7] = [
-    (-1.00, 1.00, -0.0766, 0.300, true),   // A
-    (-0.01, 0.03, 0.0000, 0.010, false),   // beta
-    (-1.50, 1.50, -0.0452, 0.450, true),   // gamma
-    (-5.00, 5.0, -0.500, 2.500, false),    // t_0
-    (-1.50, 1.50, -0.1510, 0.600, true),   // tau_rise
-    (-1.50, 1.50, -0.1486, 0.750, true),   // tau_fall
-    (-1.50, 1.00, -0.1509, 0.750, true),   // extra_sigma
+    // A offset: JAX range [-0.07, +0.04], mean -0.015, std 0.036
+    (-0.30, 0.20, -0.015, 0.080, true),    // A  (keep g close to r)
+    (-0.02, 0.02, -0.001, 0.008, false),   // beta
+    // gamma offset: JAX range [-0.47, +0.09], mean -0.095, std 0.22
+    (-0.80, 0.50, -0.095, 0.250, true),    // gamma
+    // t_0 offset: JAX range [-2.3, +0.1], mean -1.18, std 0.86
+    (-5.00, 3.0, -1.181, 1.500, false),    // t_0
+    // tau_rise offset: JAX range [-0.63, +0.09], mean -0.195, std 0.28
+    (-1.00, 0.50, -0.195, 0.350, true),    // tau_rise
+    // tau_fall offset: JAX range [-0.44, -0.22], mean -0.323, std 0.10
+    (-0.80, 0.30, -0.323, 0.250, true),    // tau_fall
+    // extra_sigma offset: JAX range [-0.29, +0.32], mean -0.025, std 0.23
+    (-0.60, 0.60, -0.025, 0.300, true),    // extra_sigma
 ];
 
 /// Flattened prior arrays: indices 0..7 = r-band, 7..14 = g-band (absolute for g).
@@ -113,8 +129,8 @@ pub fn offsets_to_absolute(raw: &[f64; N_PARAMS]) -> [f64; N_PARAMS] {
 /// Convert magnitude + error to flux + flux_error (zeropoint = 23.9).
 pub fn mag_to_flux(mag: f64, mag_err: f64) -> (f64, f64) {
     let zp = 23.9;
-    let flux = 10.0_f64.powf((zp - mag) / 2.5);
-    let flux_err = flux * mag_err * 10.0_f64.ln() / 2.5;
+    let flux = ((zp - mag) / 2.5 * std::f64::consts::LN_10).exp();
+    let flux_err = flux * mag_err * std::f64::consts::LN_10 / 2.5;
     (flux, flux_err)
 }
 
@@ -430,7 +446,7 @@ pub fn to_physical(raw: &[f64; N_PARAMS], priors: &PriorArrays) -> [f64; N_PARAM
     let mut phys = abs;
     for i in 0..N_PARAMS {
         if priors.logged[i] {
-            phys[i] = 10.0_f64.powf(abs[i]);
+            phys[i] = (abs[i] * std::f64::consts::LN_10).exp();
         }
     }
     phys
@@ -514,6 +530,27 @@ pub fn reduced_chi2(
     chi2_sum / dof
 }
 
+/// Precomputed per-band observation indices for branch-free cost evaluation.
+pub struct BandIndices {
+    pub r_indices: Vec<usize>,
+    pub g_indices: Vec<usize>,
+}
+
+impl BandIndices {
+    pub fn new(obs: &[Obs], orig_size: usize) -> Self {
+        let mut r_indices = Vec::new();
+        let mut g_indices = Vec::new();
+        for i in 0..orig_size {
+            if obs[i].band == 0 {
+                r_indices.push(i);
+            } else {
+                g_indices.push(i);
+            }
+        }
+        BandIndices { r_indices, g_indices }
+    }
+}
+
 /// PSO cost with prior penalty (for guiding the search).
 /// raw[0..7] = r-band values, raw[7..14] = g-band offsets from r-band.
 /// Uses band-balanced likelihood so each filter contributes equally.
@@ -522,9 +559,10 @@ pub fn pso_cost(
     raw: &[f64; N_PARAMS],
     obs: &[Obs],
     param_map: &[[usize; 7]],
-    orig_size: usize,
+    _orig_size: usize,
     priors: &PriorArrays,
     min_extra_sigma: f64,
+    band_indices: &BandIndices,
 ) -> f64 {
     let phys = to_physical(raw, priors);
 
@@ -533,35 +571,40 @@ pub fn pso_cost(
     let g_params: [f64; N_BASE] = std::array::from_fn(|i| phys[N_BASE + i]);
     let constraint = villar_constraint_band(&r_params).max(villar_constraint_band(&g_params));
 
-    let mut neg_ll = 10_000.0 * constraint;
+    if constraint > 0.0 {
+        return 1e12 + 10_000.0 * constraint;
+    }
 
-    // Band-balanced data likelihood
+    // Band-balanced data likelihood — branch-free loops over precomputed indices
     let mut ll_r = 0.0;
-    let mut ll_g = 0.0;
-    let mut n_r = 0usize;
-    let mut n_g = 0usize;
-
-    for (i, ob) in obs.iter().enumerate().take(orig_size) {
+    for &i in &band_indices.r_indices {
         let (model_flux, extra_sigma) =
-            villar_flux_at(&phys, ob, &param_map[i], min_extra_sigma);
+            villar_flux_at(&phys, &obs[i], &param_map[i], min_extra_sigma);
         if !model_flux.is_finite() {
             return 1e12;
         }
-        let sigma2 = ob.flux_err * ob.flux_err + extra_sigma * extra_sigma;
-        let diff = ob.flux - model_flux;
-        // Omit sigma2.ln() normalization (profile likelihood):
-        // avoids incentivising the optimizer to collapse extra_sigma.
-        let contrib = diff * diff / sigma2;
-        if ob.band == 0 {
-            ll_r += contrib;
-            n_r += 1;
-        } else {
-            ll_g += contrib;
-            n_g += 1;
-        }
+        let sigma2 = obs[i].flux_err * obs[i].flux_err + extra_sigma * extra_sigma;
+        let diff = obs[i].flux - model_flux;
+        ll_r += diff * diff / sigma2;
     }
 
+    let mut ll_g = 0.0;
+    for &i in &band_indices.g_indices {
+        let (model_flux, extra_sigma) =
+            villar_flux_at(&phys, &obs[i], &param_map[i], min_extra_sigma);
+        if !model_flux.is_finite() {
+            return 1e12;
+        }
+        let sigma2 = obs[i].flux_err * obs[i].flux_err + extra_sigma * extra_sigma;
+        let diff = obs[i].flux - model_flux;
+        ll_g += diff * diff / sigma2;
+    }
+
+    let n_r = band_indices.r_indices.len();
+    let n_g = band_indices.g_indices.len();
     let n_total = (n_r + n_g) as f64;
+
+    let mut neg_ll = 0.0;
     if n_r > 0 {
         neg_ll += (ll_r / n_r as f64) * (n_total / 2.0);
     }
@@ -592,9 +635,9 @@ pub struct PsoConfig {
 impl Default for PsoConfig {
     fn default() -> Self {
         PsoConfig {
-            n_particles: 300,
-            max_iters: 2000,
-            stall_iters: 100,
+            n_particles: 200,
+            max_iters: 1500,
+            stall_iters: 60,
             w: 0.9,   // initial inertia (decays to 0.4 over iterations)
             c1: 1.5,
             c2: 1.5,
@@ -741,145 +784,6 @@ pub fn pso_minimize(
     (gbest_pos, gbest_cost)
 }
 
-/// Nelder-Mead simplex local optimizer (bounded).
-/// Much better at navigating curved cost surfaces than coordinate descent.
-pub fn nelder_mead_refine(
-    cost_fn: &dyn Fn(&[f64; N_PARAMS]) -> f64,
-    start: &[f64; N_PARAMS],
-    lower: &[f64; N_PARAMS],
-    upper: &[f64; N_PARAMS],
-    max_evals: usize,
-) -> ([f64; N_PARAMS], f64) {
-    let n = N_PARAMS;
-    let n1 = n + 1;
-
-    // Clamp a point to bounds
-    let clamp = |p: &mut [f64; N_PARAMS]| {
-        for d in 0..n {
-            p[d] = p[d].clamp(lower[d], upper[d]);
-        }
-    };
-
-    // Build initial simplex: start + perturbations along each axis
-    let mut simplex: Vec<[f64; N_PARAMS]> = Vec::with_capacity(n1);
-    let mut costs: Vec<f64> = Vec::with_capacity(n1);
-
-    simplex.push(*start);
-    costs.push(cost_fn(start));
-
-    for d in 0..n {
-        let mut vertex = *start;
-        let range = upper[d] - lower[d];
-        let step = range * 0.05; // 5% of range
-        vertex[d] = (vertex[d] + step).min(upper[d]);
-        if (vertex[d] - start[d]).abs() < 1e-12 {
-            vertex[d] = (vertex[d] - step).max(lower[d]);
-        }
-        costs.push(cost_fn(&vertex));
-        simplex.push(vertex);
-    }
-
-    let alpha = 1.0;  // reflection
-    let gamma_nm = 2.0;  // expansion
-    let rho = 0.5;    // contraction
-    let sigma = 0.5;  // shrink
-
-    let mut evals = n1;
-
-    while evals < max_evals {
-        // Sort simplex by cost
-        let mut order: Vec<usize> = (0..n1).collect();
-        order.sort_by(|&a, &b| costs[a].partial_cmp(&costs[b]).unwrap_or(std::cmp::Ordering::Equal));
-        let sorted_simplex: Vec<[f64; N_PARAMS]> = order.iter().map(|&i| simplex[i]).collect();
-        let sorted_costs: Vec<f64> = order.iter().map(|&i| costs[i]).collect();
-        simplex = sorted_simplex;
-        costs = sorted_costs;
-
-        // Check convergence: cost spread
-        let spread = costs[n] - costs[0];
-        if spread < 1e-10 * costs[0].abs().max(1.0) {
-            break;
-        }
-
-        // Centroid of all but worst
-        let mut centroid = [0.0; N_PARAMS];
-        for d in 0..n {
-            for i in 0..n {
-                centroid[d] += simplex[i][d];
-            }
-            centroid[d] /= n as f64;
-        }
-
-        // Reflection
-        let mut xr = [0.0; N_PARAMS];
-        for d in 0..n {
-            xr[d] = centroid[d] + alpha * (centroid[d] - simplex[n][d]);
-        }
-        clamp(&mut xr);
-        let fr = cost_fn(&xr);
-        evals += 1;
-
-        if fr < costs[n - 1] && fr >= costs[0] {
-            simplex[n] = xr;
-            costs[n] = fr;
-            continue;
-        }
-
-        if fr < costs[0] {
-            // Expansion
-            let mut xe = [0.0; N_PARAMS];
-            for d in 0..n {
-                xe[d] = centroid[d] + gamma_nm * (xr[d] - centroid[d]);
-            }
-            clamp(&mut xe);
-            let fe = cost_fn(&xe);
-            evals += 1;
-            if fe < fr {
-                simplex[n] = xe;
-                costs[n] = fe;
-            } else {
-                simplex[n] = xr;
-                costs[n] = fr;
-            }
-            continue;
-        }
-
-        // Contraction
-        let mut xc = [0.0; N_PARAMS];
-        for d in 0..n {
-            xc[d] = centroid[d] + rho * (simplex[n][d] - centroid[d]);
-        }
-        clamp(&mut xc);
-        let fc = cost_fn(&xc);
-        evals += 1;
-
-        if fc < costs[n] {
-            simplex[n] = xc;
-            costs[n] = fc;
-            continue;
-        }
-
-        // Shrink
-        for i in 1..n1 {
-            for d in 0..n {
-                simplex[i][d] = simplex[0][d] + sigma * (simplex[i][d] - simplex[0][d]);
-            }
-            clamp(&mut simplex[i]);
-            costs[i] = cost_fn(&simplex[i]);
-            evals += 1;
-        }
-    }
-
-    // Return best
-    let best_idx = costs
-        .iter()
-        .enumerate()
-        .min_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-        .unwrap()
-        .0;
-    (simplex[best_idx], costs[best_idx])
-}
-
 // ─── Top-level fit function ──────────────────────────────────────────────────
 
 pub struct FitResult {
@@ -946,20 +850,21 @@ pub fn fit_lightcurve(csv_path: &str) -> Result<FitResult, String> {
     }
 
     let config = PsoConfig::default();
+    let band_indices = BandIndices::new(&data.obs, data.orig_size);
 
-    // Multi-seed PSO (7 seeds, skip later ones if first three agree)
-    let seeds: [u64; 4] = [42, 137, 271, 389];
+    // Multi-seed PSO (3 seeds, skip later ones if first two agree)
+    let seeds: [u64; 3] = [42, 137, 271];
     let mut best_params = [0.0; N_PARAMS];
     let mut best_cost = f64::INFINITY;
     let mut first_cost = f64::INFINITY;
 
     let cost_fn = |raw: &[f64; N_PARAMS]| {
-        pso_cost(raw, &data.obs, &param_map, data.orig_size, &priors, 0.0)
+        pso_cost(raw, &data.obs, &param_map, data.orig_size, &priors, 0.0, &band_indices)
     };
 
     let t_pso_start = Instant::now();
     for (i, &seed) in seeds.iter().enumerate() {
-        if i >= 3 && (first_cost - best_cost).abs() < 0.05 * best_cost.abs().max(1e-10) {
+        if i >= 2 && (first_cost - best_cost).abs() < 0.05 * best_cost.abs().max(1e-10) {
             break;
         }
         let (params, cost) = pso_minimize(&cost_fn, &lower, &upper, &priors, &config, seed);
@@ -973,21 +878,15 @@ pub fn fit_lightcurve(csv_path: &str) -> Result<FitResult, String> {
     }
     let t_pso = t_pso_start.elapsed();
 
-    // Nelder-Mead local refinement
-    let t_refine_start = Instant::now();
-    let (best_params, _) = nelder_mead_refine(&cost_fn, &best_params, &lower, &upper, 15_000);
-    let t_refine = t_refine_start.elapsed();
-
     let abs_raw = offsets_to_absolute(&best_params);
     let phys = to_physical(&best_params, &priors);
     let rchi2 = reduced_chi2(&best_params, &data.obs, &param_map, data.orig_size, &priors);
 
     let t_total = t_start.elapsed();
     eprintln!(
-        "Timing: preprocess {:.1}ms | PSO {:.1}ms | refine {:.1}ms | total {:.1}ms",
+        "Timing: preprocess {:.1}ms | PSO {:.1}ms | total {:.1}ms",
         t_preprocess.as_secs_f64() * 1000.0,
         t_pso.as_secs_f64() * 1000.0,
-        t_refine.as_secs_f64() * 1000.0,
         t_total.as_secs_f64() * 1000.0,
     );
 
@@ -1193,10 +1092,112 @@ mod python_bindings {
         Ok(result)
     }
 
+    /// Fit one or more ZTF light curve CSVs using the GPU batch PSO.
+    /// Accepts a single path (str) or a list of paths.
+    /// Returns a list of result dicts (same format as `fit()`).
+    #[cfg(feature = "cuda")]
+    #[pyfunction]
+    fn fit_gpu(csv_paths: &Bound<'_, pyo3::types::PyAny>) -> PyResult<PyObject> {
+        use crate::gpu::{GpuBatchData, GpuContext, SourceData};
+
+        // Accept str or list of str
+        let paths: Vec<String> = if let Ok(s) = csv_paths.extract::<String>() {
+            vec![s]
+        } else {
+            csv_paths.extract::<Vec<String>>()?
+        };
+
+        // Preprocess
+        let mut sources = Vec::new();
+        let mut failed: Vec<(usize, String)> = Vec::new();
+        for (i, p) in paths.iter().enumerate() {
+            match preprocess(p) {
+                Ok(data) => {
+                    let name = std::path::Path::new(p)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("?")
+                        .to_string();
+                    sources.push((i, SourceData { name, data }));
+                }
+                Err(e) => failed.push((i, e)),
+            }
+        }
+
+        if sources.is_empty() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "No valid sources after preprocessing",
+            ));
+        }
+
+        let config = PsoConfig::default();
+        let gpu = GpuContext::new(0)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+
+        let source_data: Vec<&SourceData> = sources.iter().map(|(_, s)| s).collect();
+        let batch_data = GpuBatchData::new(&source_data)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+        let results = gpu
+            .batch_pso_multi_seed(&batch_data, &source_data, &config)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+
+        // Build output: one dict per input path (None for failed ones)
+        Python::with_gil(|py| {
+            let out_list = pyo3::types::PyList::empty(py);
+
+            // Map gpu results back to original indices
+            let mut result_iter = results.into_iter();
+            let mut source_iter = sources.iter();
+            let mut next_source = source_iter.next();
+            let mut next_failed = failed.iter().peekable();
+
+            for orig_idx in 0..paths.len() {
+                // Check if this index failed
+                if next_failed.peek().map_or(false, |(fi, _)| *fi == orig_idx) {
+                    let (_, err) = next_failed.next().unwrap();
+                    let d = PyDict::new(py);
+                    d.set_item("error", err.as_str())?;
+                    out_list.append(d)?;
+                    continue;
+                }
+
+                if next_source.map_or(false, |(si, _)| *si == orig_idx) {
+                    let res = result_iter.next().unwrap();
+                    next_source = source_iter.next();
+
+                    let dict = PyDict::new(py);
+                    let params = PyDict::new(py);
+                    let raw_params = PyDict::new(py);
+                    for (filt_idx, filt) in FILTERS.iter().enumerate() {
+                        for (p_idx, pname) in PARAM_NAMES.iter().enumerate() {
+                            let idx = filt_idx * N_BASE + p_idx;
+                            let key = format!("{}_{}", pname, filt);
+                            params.set_item(&key, res.phys_params[idx])?;
+                            raw_params.set_item(&key, res.raw_params[idx])?;
+                        }
+                    }
+                    dict.set_item("params", params)?;
+                    dict.set_item("raw_params", raw_params)?;
+                    dict.set_item("reduced_chi2", res.reduced_chi2)?;
+                    out_list.append(dict)?;
+                }
+            }
+
+            // If single input, return single dict instead of list
+            if paths.len() == 1 {
+                Ok(out_list.get_item(0)?.unbind())
+            } else {
+                Ok(out_list.into_any().unbind())
+            }
+        })
+    }
+
     #[pymodule]
     fn villar_pso(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(fit, m)?)?;
         m.add_function(wrap_pyfunction!(eval_villar, m)?)?;
+        #[cfg(feature = "cuda")]
+        m.add_function(wrap_pyfunction!(fit_gpu, m)?)?;
         Ok(())
     }
 }
