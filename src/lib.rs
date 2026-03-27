@@ -830,8 +830,17 @@ impl FitResult {
     }
 }
 
+/// Run the full fitting pipeline on a CSV file (quiet mode — no per-source output).
+pub fn fit_lightcurve_quiet(csv_path: &str) -> Result<FitResult, String> {
+    fit_lightcurve_inner(csv_path, false)
+}
+
 /// Run the full fitting pipeline on a CSV file.
 pub fn fit_lightcurve(csv_path: &str) -> Result<FitResult, String> {
+    fit_lightcurve_inner(csv_path, true)
+}
+
+fn fit_lightcurve_inner(csv_path: &str, verbose: bool) -> Result<FitResult, String> {
     use std::time::Instant;
 
     let t_start = Instant::now();
@@ -883,12 +892,14 @@ pub fn fit_lightcurve(csv_path: &str) -> Result<FitResult, String> {
     let rchi2 = reduced_chi2(&best_params, &data.obs, &param_map, data.orig_size, &priors);
 
     let t_total = t_start.elapsed();
-    eprintln!(
-        "Timing: preprocess {:.1}ms | PSO {:.1}ms | total {:.1}ms",
-        t_preprocess.as_secs_f64() * 1000.0,
-        t_pso.as_secs_f64() * 1000.0,
-        t_total.as_secs_f64() * 1000.0,
-    );
+    if verbose {
+        eprintln!(
+            "Timing: preprocess {:.1}ms | PSO {:.1}ms | total {:.1}ms",
+            t_preprocess.as_secs_f64() * 1000.0,
+            t_pso.as_secs_f64() * 1000.0,
+            t_total.as_secs_f64() * 1000.0,
+        );
+    }
 
     // Keep only the real (unpadded) observations for plotting
     // Padded obs have phase=1000.0 and flux_err=1000.0

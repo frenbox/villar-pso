@@ -85,6 +85,10 @@ struct DevBuf {
     size: usize,
 }
 
+// Safety: CUDA device pointers can be used from any host thread provided
+// cudaSetDevice is called first. GpuContext::set_device / batch_pso handle this.
+unsafe impl Send for DevBuf {}
+
 impl DevBuf {
     fn alloc(size: usize) -> Result<Self, String> {
         let mut ptr: *mut u8 = ptr::null_mut();
@@ -214,10 +218,26 @@ pub struct BatchPsoResult {
     pub cost: f64,
 }
 
+// Safety: GpuContext is just a device ID. Each method calls cudaSetDevice
+// before any CUDA work, so it is safe to Send across threads.
+unsafe impl Send for GpuContext {}
+unsafe impl Sync for GpuContext {}
+
 impl GpuContext {
     pub fn new(device: i32) -> Result<Self, String> {
         cuda_check(unsafe { cudaSetDevice(device) })?;
         Ok(Self { _device: device })
+    }
+
+    /// Bind the calling thread to this context's GPU device.
+    /// Call this before `GpuBatchData::new` when using multi-GPU.
+    pub fn set_device(&self) -> Result<(), String> {
+        cuda_check(unsafe { cudaSetDevice(self._device) })
+    }
+
+    /// Device index for this context.
+    pub fn device_id(&self) -> i32 {
+        self._device
     }
 
     /// Run batch PSO for all sources simultaneously on the GPU.
@@ -232,6 +252,9 @@ impl GpuContext {
         config: &PsoConfig,
         seed: u64,
     ) -> Result<Vec<BatchPsoResult>, String> {
+        // Ensure this thread is bound to the correct GPU device
+        cuda_check(unsafe { cudaSetDevice(self._device) })?;
+
         let n_sources = data.n_sources;
         let dim = N_PARAMS;
         let n_particles = config.n_particles;

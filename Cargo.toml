@@ -33,6 +33,15 @@ required-features = ["cuda"]
 name = "cpu-parallel-bench"
 path = "src/bin/cpu_parallel_bench.rs"
 
+[[bin]]
+name = "cpu-scaling-bench"
+path = "src/bin/cpu_scaling_bench.rs"
+
+[[bin]]
+name = "gpu-scaling-bench"
+path = "src/bin/gpu_scaling_bench.rs"
+required-features = ["cuda"]
+
 [profile.release]
 lto = "fat"
 codegen-units = 1
