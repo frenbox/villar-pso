@@ -175,7 +175,7 @@ impl GpuBatchData {
                 all_times.push(ob.phase);
                 all_flux.push(ob.flux);
                 all_flux_err_sq.push(ob.flux_err * ob.flux_err);
-                all_band.push(ob.band as c_int);
+                all_band.push(ob.band.idx() as c_int);
             }
             offsets.push(all_times.len() as c_int);
             n_r_vec.push(bi.r_indices.len() as c_int);

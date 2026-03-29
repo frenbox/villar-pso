@@ -140,7 +140,7 @@ pub struct Obs {
     pub phase: f64,
     pub flux: f64,
     pub flux_err: f64,
-    pub band: usize, // 0 = ZTF_r, 1 = ZTF_g
+    pub band: Band,
 }
 
 /// Raw CSV row.
@@ -157,11 +157,59 @@ pub struct RawRow {
     pub filter: Option<String>,
 }
 
+/// Photometric band.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
+pub enum Band {
+    #[serde(rename = "g", alias = "ZTF_g")]
+    G,
+    #[serde(rename = "r", alias = "ZTF_r")]
+    R,
+    #[serde(rename = "i")]
+    I,
+    #[serde(rename = "z")]
+    Z,
+    #[serde(rename = "y")]
+    Y,
+    #[serde(rename = "u")]
+    U,
+}
+
+/// The two bands used by the Villar joint fitter.
+pub const VILLAR_BANDS: [Band; 2] = [Band::R, Band::G];
+
+impl Band {
+    /// Index into parameter arrays (R=0, G=1).
+    pub fn idx(self) -> usize {
+        match self {
+            Band::R => 0,
+            Band::G => 1,
+            _ => panic!("Band {:?} not supported for Villar fitting", self),
+        }
+    }
+
+    /// Whether this band is used in the Villar two-band fitter.
+    pub fn is_villar(self) -> bool {
+        matches!(self, Band::R | Band::G)
+    }
+}
+
+/// Structured photometry input (alternative to CSV).
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct PhotometryMag {
+    #[serde(alias = "jd")]
+    pub time: f64,
+    #[serde(alias = "magpsf")]
+    pub mag: f32,
+    #[serde(alias = "sigmapsf")]
+    pub mag_err: f32,
+    pub band: Band,
+}
+
 /// Weighted-average observations within `eps` days per filter.
 fn merge_close_times(obs: &mut Vec<Obs>, eps: f64) {
     let mut merged = Vec::new();
-    for band_idx in 0..2 {
-        let mut band_obs: Vec<&Obs> = obs.iter().filter(|o| o.band == band_idx).collect();
+    for &band in &VILLAR_BANDS {
+        let mut band_obs: Vec<&Obs> = obs.iter().filter(|o| o.band == band).collect();
         band_obs.sort_by(|a, b| a.phase.partial_cmp(&b.phase).unwrap());
 
         let mut i = 0;
@@ -184,7 +232,7 @@ fn merge_close_times(obs: &mut Vec<Obs>, eps: f64) {
                 phase: wt_phase / w_sum,
                 flux: wt_flux / w_sum,
                 flux_err: (1.0 / w_sum).sqrt(),
-                band: band_idx,
+                band,
             });
             i = j;
         }
@@ -256,7 +304,7 @@ pub fn preprocess(csv_path: &str) -> Result<PreprocessedData, String> {
     let mut times = Vec::new();
     let mut mags = Vec::new();
     let mut mag_errs = Vec::new();
-    let mut band_indices = Vec::new();
+    let mut bands = Vec::new();
 
     for result in rdr.records() {
         let record = result.map_err(|e| format!("CSV parse error: {}", e))?;
@@ -279,18 +327,18 @@ pub fn preprocess(csv_path: &str) -> Result<PreprocessedData, String> {
         };
 
         // Determine band
-        let band_idx = if has_fid && !has_filter {
+        let band = if has_fid && !has_filter {
             let fid_str = record.get(col_idx("fid").unwrap()).unwrap_or("");
             match fid_str.parse::<u32>() {
-                Ok(1) => 1, // fid=1 → g → band 1
-                Ok(2) => 0, // fid=2 → r → band 0
+                Ok(1) => Band::G,
+                Ok(2) => Band::R,
                 _ => continue,
             }
         } else if has_filter {
             let filt = record.get(col_idx("filter").unwrap()).unwrap_or("");
             match filt {
-                "r" | "ZTF_r" => 0,
-                "g" | "ZTF_g" => 1,
+                "r" | "ZTF_r" => Band::R,
+                "g" | "ZTF_g" => Band::G,
                 _ => continue,
             }
         } else {
@@ -307,7 +355,7 @@ pub fn preprocess(csv_path: &str) -> Result<PreprocessedData, String> {
         times.push(mjd);
         mags.push(mag);
         mag_errs.push(mag_err);
-        band_indices.push(band_idx);
+        bands.push(band);
     }
 
     if times.is_empty() {
@@ -325,12 +373,41 @@ pub fn preprocess(csv_path: &str) -> Result<PreprocessedData, String> {
             phase: times[i], // still MJD, will convert to phase below
             flux,
             flux_err,
-            band: band_indices[i],
+            band: bands[i],
         });
     }
 
+    finalize_preprocessing(obs)
+}
+
+/// Preprocess from a slice of `PhotometryMag` structs (same pipeline as CSV).
+pub fn preprocess_from_photometry(data: &[PhotometryMag]) -> Result<PreprocessedData, String> {
+    if data.is_empty() {
+        return Err("Empty photometry input.".to_string());
+    }
+
+    // mag → flux
+    let mut obs: Vec<Obs> = Vec::with_capacity(data.len());
+    for p in data {
+        let (flux, flux_err) = mag_to_flux(p.mag as f64, p.mag_err as f64);
+        if !flux.is_finite() || !flux_err.is_finite() || flux <= 0.0 || flux_err <= 0.0 {
+            continue;
+        }
+        obs.push(Obs {
+            phase: p.time, // still MJD, will convert to phase below
+            flux,
+            flux_err,
+            band: p.band,
+        });
+    }
+
+    finalize_preprocessing(obs)
+}
+
+/// Shared pipeline: phase, merge, truncate, normalise, pad.
+fn finalize_preprocessing(mut obs: Vec<Obs>) -> Result<PreprocessedData, String> {
     // Phase: t=0 at brightest r-band point
-    let r_obs: Vec<&Obs> = obs.iter().filter(|o| o.band == 0).collect();
+    let r_obs: Vec<&Obs> = obs.iter().filter(|o| o.band == Band::R).collect();
     if r_obs.is_empty() {
         return Err("No r-band data.".to_string());
     }
@@ -349,8 +426,8 @@ pub fn preprocess(csv_path: &str) -> Result<PreprocessedData, String> {
     // Truncate to [-50, 100]
     obs.retain(|o| o.phase >= -50.0 && o.phase <= 100.0);
 
-    let n_r = obs.iter().filter(|o| o.band == 0).count();
-    let n_g = obs.iter().filter(|o| o.band == 1).count();
+    let n_r = obs.iter().filter(|o| o.band == Band::R).count();
+    let n_g = obs.iter().filter(|o| o.band == Band::G).count();
     if n_r <= 2 {
         return Err(format!(
             "Only {} points in ZTF_r after preprocessing (need >2).",
@@ -363,8 +440,6 @@ pub fn preprocess(csv_path: &str) -> Result<PreprocessedData, String> {
             n_g
         ));
     }
-
-    // Skip MW extinction (E(B-V)=0 assumed, matching JAX fallback)
 
     // Normalise by peak flux
     let peak = obs
@@ -384,8 +459,8 @@ pub fn preprocess(csv_path: &str) -> Result<PreprocessedData, String> {
     // Pad each filter to equal length (next power-of-2 / 2)
     let n_total = (orig_size as f64).log2().ceil().exp2() as usize;
     let n_per_filt = n_total / 2;
-    for band_idx in 0..2 {
-        let n_filt = obs.iter().filter(|o| o.band == band_idx).count();
+    for &band in &VILLAR_BANDS {
+        let n_filt = obs.iter().filter(|o| o.band == band).count();
         let n_extra = if n_per_filt > n_filt {
             n_per_filt - n_filt
         } else {
@@ -396,15 +471,15 @@ pub fn preprocess(csv_path: &str) -> Result<PreprocessedData, String> {
                 phase: 1000.0,
                 flux: 0.1,
                 flux_err: 1000.0,
-                band: band_idx,
+                band,
             });
         }
     }
 
     // Sort by (band, phase)
     obs.sort_by(|a, b| {
-        a.band
-            .cmp(&b.band)
+        a.band.idx()
+            .cmp(&b.band.idx())
             .then(a.phase.partial_cmp(&b.phase).unwrap())
     });
 
@@ -423,7 +498,7 @@ pub struct PreprocessedData {
 pub fn build_param_map(obs: &[Obs]) -> Vec<[usize; 7]> {
     obs.iter()
         .map(|o| {
-            let offset = o.band * N_BASE;
+            let offset = o.band.idx() * N_BASE;
             [
                 offset,
                 offset + 1,
@@ -541,10 +616,10 @@ impl BandIndices {
         let mut r_indices = Vec::new();
         let mut g_indices = Vec::new();
         for i in 0..orig_size {
-            if obs[i].band == 0 {
-                r_indices.push(i);
-            } else {
-                g_indices.push(i);
+            match obs[i].band {
+                Band::R => r_indices.push(i),
+                Band::G => g_indices.push(i),
+                _ => {}
             }
         }
         BandIndices { r_indices, g_indices }
@@ -890,111 +965,60 @@ pub fn fit_lightcurve(csv_path: &str) -> Result<FitResult, String> {
     })
 }
 
-// ─── Plotting (via Python/matplotlib) ────────────────────────────────────────
+/// Run the full fitting pipeline on a slice of `PhotometryMag` structs.
+pub fn fit_photometry(data: &[PhotometryMag]) -> Result<FitResult, String> {
+    let data = preprocess_from_photometry(data)?;
 
-/// Write observation data + best-fit params to a JSON file, then call a
-/// bundled Python script to produce the diagnostic PNG.
-pub fn make_plot(result: &FitResult, name: &str, output_dir: &str) -> Result<String, String> {
-    std::fs::create_dir_all(output_dir)
-        .map_err(|e| format!("Cannot create output dir: {}", e))?;
+    let param_map = build_param_map(&data.obs);
+    let priors = PriorArrays::new();
 
-    let json_path = format!("{}/{}_fitdata.json", output_dir, name);
-    let png_path = format!("{}/{}_best_fit.png", output_dir, name);
-
-    // Build JSON payload
-    let obs_json: Vec<String> = result.obs.iter().map(|o| {
-        format!(
-            r#"{{"phase":{}, "flux":{}, "flux_err":{}, "band":{}}}"#,
-            o.phase, o.flux, o.flux_err, o.band
-        )
-    }).collect();
-
-    let params_json: Vec<String> = result.phys_params.iter().map(|v| format!("{}", v)).collect();
-
-    let json = format!(
-        r#"{{"name":"{}","reduced_chi2":{},"params":[{}],"obs":[{}]}}"#,
-        name,
-        result.reduced_chi2,
-        params_json.join(","),
-        obs_json.join(","),
-    );
-
-    std::fs::write(&json_path, &json)
-        .map_err(|e| format!("Cannot write JSON: {}", e))?;
-
-    // Inline Python plotting script
-    let py_script = format!(r#"
-import json, sys
-import numpy as np
-import matplotlib.pyplot as plt
-
-with open("{json_path}") as f:
-    d = json.load(f)
-
-name = d["name"]
-rchi2 = d["reduced_chi2"]
-params = d["params"]  # 14 values: [r0..r6, g0..g6] in physical space
-
-def villar(t, p_offset):
-    A, beta, gamma, t0, tau_rise, tau_fall, _ = params[p_offset:p_offset+7]
-    gamma = max(gamma, 0.0)
-    phase = np.clip(t - t0, a_min=-50.0 * tau_rise, a_max=None)
-    f_const = A / (1.0 + np.exp(-phase / tau_rise))
-    return np.where(
-        gamma - phase >= 0,
-        f_const * (1.0 - beta * phase),
-        f_const * (1.0 - beta * gamma) * np.exp(-(phase - gamma) / tau_fall),
-    )
-
-obs = d["obs"]
-colors = {{0: "tomato", 1: "steelblue"}}
-labels = {{0: "ZTF_r", 1: "ZTF_g"}}
-t_dense = np.linspace(-50, 100, 300)
-
-fig, ax = plt.subplots(figsize=(8, 5))
-for band_idx in [0, 1]:
-    c = colors[band_idx]
-    pts = [o for o in obs if o["band"] == band_idx]
-    if not pts:
-        continue
-    ph = [o["phase"] for o in pts]
-    fl = [o["flux"] for o in pts]
-    fe = [o["flux_err"] for o in pts]
-    ax.errorbar(ph, fl, yerr=fe, fmt="o", color=c, label=f"data {{labels[band_idx]}}", zorder=3)
-    curve = villar(t_dense, band_idx * 7)
-    ax.plot(t_dense, curve, color=c, lw=2, label=f"fit {{labels[band_idx]}}")
-
-ax.set_xlabel("Phase (days)", fontsize=13)
-ax.set_ylabel("Normalised flux", fontsize=13)
-ax.set_title(f"{{name}} — best fit (χ² = {{rchi2:.3f}})", fontsize=14)
-ax.legend(fontsize=11)
-ax.grid(alpha=0.3)
-fig.tight_layout()
-fig.savefig("{png_path}", dpi=150)
-plt.close(fig)
-"#, json_path=json_path, png_path=png_path);
-
-    // Try python first (anaconda), fall back to python3
-    let status = std::process::Command::new("python")
-        .arg("-c")
-        .arg(&py_script)
-        .status()
-        .or_else(|_| {
-            std::process::Command::new("python3")
-                .arg("-c")
-                .arg(&py_script)
-                .status()
-        })
-        .map_err(|e| format!("Failed to run python/python3: {}", e))?;
-
-    if !status.success() {
-        return Err("Python plotting script failed".to_string());
+    let mut lower = [0.0; N_PARAMS];
+    let mut upper = [0.0; N_PARAMS];
+    for i in 0..N_PARAMS {
+        lower[i] = priors.mins[i];
+        upper[i] = priors.maxs[i];
     }
 
-    // Clean up JSON
-    let _ = std::fs::remove_file(&json_path);
+    let config = PsoConfig::default();
+    let band_indices = BandIndices::new(&data.obs, data.orig_size);
 
-    Ok(png_path)
+    let seeds: [u64; 3] = [42, 137, 271];
+    let mut best_params = [0.0; N_PARAMS];
+    let mut best_cost = f64::INFINITY;
+    let mut first_cost = f64::INFINITY;
+
+    let cost_fn = |raw: &[f64; N_PARAMS]| {
+        pso_cost(raw, &data.obs, &param_map, data.orig_size, &priors, 0.0, &band_indices)
+    };
+
+    for (i, &seed) in seeds.iter().enumerate() {
+        if i >= 2 && (first_cost - best_cost).abs() < 0.05 * best_cost.abs().max(1e-10) {
+            break;
+        }
+        let (params, cost) = pso_minimize(&cost_fn, &lower, &upper, &priors, &config, seed);
+        if i == 0 {
+            first_cost = cost;
+        }
+        if cost < best_cost {
+            best_cost = cost;
+            best_params = params;
+        }
+    }
+    let abs_raw = offsets_to_absolute(&best_params);
+    let phys = to_physical(&best_params, &priors);
+    let rchi2 = reduced_chi2(&best_params, &data.obs, &param_map, data.orig_size, &priors);
+
+    let real_obs: Vec<Obs> = data.obs.into_iter()
+        .filter(|o| o.phase < 999.0 && o.flux_err < 999.0)
+        .collect();
+
+    Ok(FitResult {
+        raw_params: abs_raw,
+        phys_params: phys,
+        reduced_chi2: rchi2,
+        orig_size: data.orig_size,
+        obs: real_obs,
+    })
 }
 
 // ─── PyO3 bindings ───────────────────────────────────────────────────────────
@@ -1034,7 +1058,7 @@ mod python_bindings {
                 d.set_item("phase", o.phase).unwrap();
                 d.set_item("flux", o.flux).unwrap();
                 d.set_item("flux_err", o.flux_err).unwrap();
-                d.set_item("band", o.band).unwrap();
+                d.set_item("band", o.band.idx()).unwrap();
                 d.into_any().unbind()
             }).collect();
             dict.set_item("obs", obs_list)?;
@@ -1046,15 +1070,15 @@ mod python_bindings {
     /// Evaluate the Villar model on a dense time grid for one filter.
     #[pyfunction]
     fn eval_villar(params: &Bound<'_, PyDict>, t_dense: Vec<f64>, filt: &str) -> PyResult<Vec<f64>> {
-        let filt_idx = match filt {
-            "ZTF_r" => 0,
-            "ZTF_g" => 1,
+        let band = match filt {
+            "ZTF_r" | "r" => Band::R,
+            "ZTF_g" | "g" => Band::G,
             _ => return Err(pyo3::exceptions::PyValueError::new_err(
                 format!("Unknown filter: {}. Use 'ZTF_r' or 'ZTF_g'", filt)
             )),
         };
 
-        let offset = filt_idx * N_BASE;
+        let offset = band.idx() * N_BASE;
         let pm = [offset, offset + 1, offset + 2, offset + 3, offset + 4, offset + 5, offset + 6];
 
         let mut phys = [0.0; N_PARAMS];
@@ -1069,7 +1093,7 @@ mod python_bindings {
         }
 
         let result: Vec<f64> = t_dense.iter().map(|&t| {
-            let dummy = Obs { phase: t, flux: 0.0, flux_err: 0.0, band: filt_idx };
+            let dummy = Obs { phase: t, flux: 0.0, flux_err: 0.0, band };
             let (f, _) = villar_flux_at(&phys, &dummy, &pm, 0.0);
             f
         }).collect();
