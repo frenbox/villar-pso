@@ -2,15 +2,14 @@
 name = "villar-pso"
 version = "0.1.0"
 edition = "2021"
-description = "Joint two-band Villar light-curve fitter using PSO — matches JAX fit_jax_best.py"
-default-run = "villar-pso"
+description = "Joint two-band Villar light-curve fitter using PSO"
 
 [lib]
 name = "villar_pso"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-default = ["python"]
+default = []
 python = ["pyo3"]
 cuda = ["cc"]
 
@@ -25,17 +24,8 @@ serde = { version = "1.0", features = ["derive"] }
 cc = { version = "1", features = ["parallel"], optional = true }
 
 [[bin]]
-name = "gpu-batch"
-path = "src/bin/gpu_batch.rs"
-required-features = ["cuda"]
-
-[[bin]]
-name = "cpu-parallel-bench"
-path = "src/bin/cpu_parallel_bench.rs"
-
-[[bin]]
-name = "cpu-scaling-bench"
-path = "src/bin/cpu_scaling_bench.rs"
+name = "cpu-dispatch-bench"
+path = "src/bin/cpu_dispatch_bench.rs"
 
 [[bin]]
 name = "gpu-scaling-bench"

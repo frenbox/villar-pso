@@ -14,24 +14,17 @@ From: nvidia/cuda:12.6.3-devel-ubuntu24.04
         curl gcc g++ make pkg-config libssl-dev && \
     apt-get autoremove && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-    # Install Rust
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
     export PATH="/root/.cargo/bin:$PATH"
 
-    # Build all binaries with CUDA support
     cd /app
-    CUDA_HOME=/usr/local/cuda cargo build --release --no-default-features --features cuda \
-        --bin gpu-batch \
-        --bin gpu-scaling-bench \
-        --bin cpu-scaling-bench
+    CUDA_HOME=/usr/local/cuda cargo build --release --features cuda \
+        --bin cpu-dispatch-bench \
+        --bin gpu-scaling-bench
 
-    cp /app/target/release/gpu-batch /app/gpu-batch
+    cp /app/target/release/cpu-dispatch-bench /app/cpu-dispatch-bench
     cp /app/target/release/gpu-scaling-bench /app/gpu-scaling-bench
-    cp /app/target/release/cpu-scaling-bench /app/cpu-scaling-bench
 
 %environment
     export CUDA_HOME="/usr/local/cuda"
     export LD_LIBRARY_PATH="/usr/local/cuda/lib64:$LD_LIBRARY_PATH"
-
-%runscript
-    exec /app/gpu-batch "$@"

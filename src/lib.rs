@@ -830,22 +830,9 @@ impl FitResult {
     }
 }
 
-/// Run the full fitting pipeline on a CSV file (quiet mode — no per-source output).
-pub fn fit_lightcurve_quiet(csv_path: &str) -> Result<FitResult, String> {
-    fit_lightcurve_inner(csv_path, false)
-}
-
 /// Run the full fitting pipeline on a CSV file.
 pub fn fit_lightcurve(csv_path: &str) -> Result<FitResult, String> {
-    fit_lightcurve_inner(csv_path, true)
-}
-
-fn fit_lightcurve_inner(csv_path: &str, verbose: bool) -> Result<FitResult, String> {
-    use std::time::Instant;
-
-    let t_start = Instant::now();
     let data = preprocess(csv_path)?;
-    let t_preprocess = t_start.elapsed();
 
     let param_map = build_param_map(&data.obs);
     let priors = PriorArrays::new();
@@ -871,7 +858,6 @@ fn fit_lightcurve_inner(csv_path: &str, verbose: bool) -> Result<FitResult, Stri
         pso_cost(raw, &data.obs, &param_map, data.orig_size, &priors, 0.0, &band_indices)
     };
 
-    let t_pso_start = Instant::now();
     for (i, &seed) in seeds.iter().enumerate() {
         if i >= 2 && (first_cost - best_cost).abs() < 0.05 * best_cost.abs().max(1e-10) {
             break;
@@ -885,21 +871,9 @@ fn fit_lightcurve_inner(csv_path: &str, verbose: bool) -> Result<FitResult, Stri
             best_params = params;
         }
     }
-    let t_pso = t_pso_start.elapsed();
-
     let abs_raw = offsets_to_absolute(&best_params);
     let phys = to_physical(&best_params, &priors);
     let rchi2 = reduced_chi2(&best_params, &data.obs, &param_map, data.orig_size, &priors);
-
-    let t_total = t_start.elapsed();
-    if verbose {
-        eprintln!(
-            "Timing: preprocess {:.1}ms | PSO {:.1}ms | total {:.1}ms",
-            t_preprocess.as_secs_f64() * 1000.0,
-            t_pso.as_secs_f64() * 1000.0,
-            t_total.as_secs_f64() * 1000.0,
-        );
-    }
 
     // Keep only the real (unpadded) observations for plotting
     // Padded obs have phase=1000.0 and flux_err=1000.0
