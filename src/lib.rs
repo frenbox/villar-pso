@@ -134,6 +134,85 @@ pub fn mag_to_flux(mag: f64, mag_err: f64) -> (f64, f64) {
     (flux, flux_err)
 }
 
+/// Physical Villar parameters for both bands (14 total).
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct VillarParams {
+    pub a_r: f64,
+    pub beta_r: f64,
+    pub gamma_r: f64,
+    pub t_0_r: f64,
+    pub tau_rise_r: f64,
+    pub tau_fall_r: f64,
+    pub extra_sigma_r: f64,
+    pub a_g: f64,
+    pub beta_g: f64,
+    pub gamma_g: f64,
+    pub t_0_g: f64,
+    pub tau_rise_g: f64,
+    pub tau_fall_g: f64,
+    pub extra_sigma_g: f64,
+}
+
+impl VillarParams {
+    /// Build from a 14-element physical-space array (r=0..7, g=7..14).
+    pub fn from_phys(phys: &[f64; N_PARAMS]) -> Self {
+        VillarParams {
+            a_r: phys[0],
+            beta_r: phys[1],
+            gamma_r: phys[2],
+            t_0_r: phys[3],
+            tau_rise_r: phys[4],
+            tau_fall_r: phys[5],
+            extra_sigma_r: phys[6],
+            a_g: phys[7],
+            beta_g: phys[8],
+            gamma_g: phys[9],
+            t_0_g: phys[10],
+            tau_rise_g: phys[11],
+            tau_fall_g: phys[12],
+            extra_sigma_g: phys[13],
+        }
+    }
+
+    /// Return as a flat 14-element array in standard order.
+    pub fn to_array(&self) -> [f64; N_PARAMS] {
+        [
+            self.a_r, self.beta_r, self.gamma_r, self.t_0_r,
+            self.tau_rise_r, self.tau_fall_r, self.extra_sigma_r,
+            self.a_g, self.beta_g, self.gamma_g, self.t_0_g,
+            self.tau_rise_g, self.tau_fall_g, self.extra_sigma_g,
+        ]
+    }
+
+    /// Return as a HashMap with keys like "A_ZTF_r", "beta_ZTF_g", etc.
+    pub fn to_named_map(&self) -> HashMap<String, f64> {
+        let arr = self.to_array();
+        let mut map = HashMap::new();
+        for (filt_idx, filt) in FILTERS.iter().enumerate() {
+            for (p_idx, pname) in PARAM_NAMES.iter().enumerate() {
+                map.insert(format!("{}_{}", pname, filt), arr[filt_idx * N_BASE + p_idx]);
+            }
+        }
+        map
+    }
+
+    /// Return a copy with A and extra_sigma scaled back to original flux units.
+    /// `peak_flux` is the global peak used during normalisation.
+    /// Return a copy with flux-unit parameters scaled back to original units.
+    /// A, beta, and extra_sigma have flux units; the rest are in days.
+    pub fn unnormalized(&self, peak_flux: f64) -> Self {
+        VillarParams {
+            a_r: self.a_r * peak_flux,
+            beta_r: self.beta_r * peak_flux,
+            extra_sigma_r: self.extra_sigma_r * peak_flux,
+            a_g: self.a_g * peak_flux,
+            beta_g: self.beta_g * peak_flux,
+            extra_sigma_g: self.extra_sigma_g * peak_flux,
+            ..*self
+        }
+    }
+}
+
 /// Observation for a single photometric point.
 #[derive(Debug, Clone)]
 pub struct Obs {
@@ -483,12 +562,14 @@ fn finalize_preprocessing(mut obs: Vec<Obs>) -> Result<PreprocessedData, String>
             .then(a.phase.partial_cmp(&b.phase).unwrap())
     });
 
-    Ok(PreprocessedData { obs, orig_size })
+    Ok(PreprocessedData { obs, orig_size, peak_flux: peak })
 }
 
 pub struct PreprocessedData {
     pub obs: Vec<Obs>,
     pub orig_size: usize,
+    /// Peak flux before normalisation (used to recover absolute-scale params).
+    pub peak_flux: f64,
 }
 
 // ─── Parameter map ───────────────────────────────────────────────────────────
@@ -864,8 +945,14 @@ pub fn pso_minimize(
 pub struct FitResult {
     /// Best-fit parameters in raw (log10) space, length 14.
     pub raw_params: [f64; N_PARAMS],
-    /// Best-fit parameters in physical space, length 14.
+    /// Best-fit parameters in physical space (normalised), length 14.
     pub phys_params: [f64; N_PARAMS],
+    /// Named physical parameters (normalised).
+    pub params: VillarParams,
+    /// Named physical parameters in original flux units (A, extra_sigma un-normalised).
+    pub params_unnorm: VillarParams,
+    /// Peak flux used for normalisation.
+    pub peak_flux: f64,
     /// Reduced chi-squared of the best fit.
     pub reduced_chi2: f64,
     /// Number of real observations (before padding).
@@ -956,9 +1043,13 @@ pub fn fit_lightcurve(csv_path: &str) -> Result<FitResult, String> {
         .filter(|o| o.phase < 999.0 && o.flux_err < 999.0)
         .collect();
 
+    let vp = VillarParams::from_phys(&phys);
     Ok(FitResult {
         raw_params: abs_raw,  // absolute raw values (not offsets)
         phys_params: phys,
+        params: vp,
+        params_unnorm: vp.unnormalized(data.peak_flux),
+        peak_flux: data.peak_flux,
         reduced_chi2: rchi2,
         orig_size: data.orig_size,
         obs: real_obs,
@@ -1012,9 +1103,13 @@ pub fn fit_photometry(data: &[PhotometryMag]) -> Result<FitResult, String> {
         .filter(|o| o.phase < 999.0 && o.flux_err < 999.0)
         .collect();
 
+    let vp = VillarParams::from_phys(&phys);
     Ok(FitResult {
         raw_params: abs_raw,
         phys_params: phys,
+        params: vp,
+        params_unnorm: vp.unnormalized(data.peak_flux),
+        peak_flux: data.peak_flux,
         reduced_chi2: rchi2,
         orig_size: data.orig_size,
         obs: real_obs,
