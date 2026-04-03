@@ -943,10 +943,6 @@ pub fn pso_minimize(
 // ─── Top-level fit function ──────────────────────────────────────────────────
 
 pub struct FitResult {
-    /// Best-fit parameters in raw (log10) space, length 14.
-    pub raw_params: [f64; N_PARAMS],
-    /// Best-fit parameters in physical space (normalised), length 14.
-    pub phys_params: [f64; N_PARAMS],
     /// Named physical parameters (normalised).
     pub params: VillarParams,
     /// Named physical parameters in original flux units (A, extra_sigma un-normalised).
@@ -964,14 +960,7 @@ pub struct FitResult {
 impl FitResult {
     /// Get named parameters as a HashMap.
     pub fn named_params(&self) -> HashMap<String, f64> {
-        let mut map = HashMap::new();
-        for (filt_idx, filt) in FILTERS.iter().enumerate() {
-            for (p_idx, pname) in PARAM_NAMES.iter().enumerate() {
-                let key = format!("{}_{}", pname, filt);
-                map.insert(key, self.phys_params[filt_idx * N_BASE + p_idx]);
-            }
-        }
-        map
+        self.params.to_named_map()
     }
 
     /// Print results in same format as fit_jax_best.py.
@@ -980,12 +969,13 @@ impl FitResult {
             "\nBest-fit parameters (reduced chi2 = {:.3}):",
             self.reduced_chi2
         );
+        let phys = self.params.to_array();
         for (filt_idx, filt) in FILTERS.iter().enumerate() {
             for (p_idx, pname) in PARAM_NAMES.iter().enumerate() {
                 let idx = filt_idx * N_BASE + p_idx;
                 println!(
-                    "  {}_{:<14} = {:>12.6}  (raw: {:>10.6})",
-                    pname, filt, self.phys_params[idx], self.raw_params[idx]
+                    "  {}_{:<14} = {:>12.6}",
+                    pname, filt, phys[idx]
                 );
             }
         }
@@ -1033,7 +1023,6 @@ pub fn fit_lightcurve(csv_path: &str) -> Result<FitResult, String> {
             best_params = params;
         }
     }
-    let abs_raw = offsets_to_absolute(&best_params);
     let phys = to_physical(&best_params, &priors);
     let rchi2 = reduced_chi2(&best_params, &data.obs, &param_map, data.orig_size, &priors);
 
@@ -1045,8 +1034,6 @@ pub fn fit_lightcurve(csv_path: &str) -> Result<FitResult, String> {
 
     let vp = VillarParams::from_phys(&phys);
     Ok(FitResult {
-        raw_params: abs_raw,  // absolute raw values (not offsets)
-        phys_params: phys,
         params: vp,
         params_unnorm: vp.unnormalized(data.peak_flux),
         peak_flux: data.peak_flux,
@@ -1095,7 +1082,6 @@ pub fn fit_photometry(data: &[PhotometryMag]) -> Result<FitResult, String> {
             best_params = params;
         }
     }
-    let abs_raw = offsets_to_absolute(&best_params);
     let phys = to_physical(&best_params, &priors);
     let rchi2 = reduced_chi2(&best_params, &data.obs, &param_map, data.orig_size, &priors);
 
@@ -1105,8 +1091,6 @@ pub fn fit_photometry(data: &[PhotometryMag]) -> Result<FitResult, String> {
 
     let vp = VillarParams::from_phys(&phys);
     Ok(FitResult {
-        raw_params: abs_raw,
-        phys_params: phys,
         params: vp,
         params_unnorm: vp.unnormalized(data.peak_flux),
         peak_flux: data.peak_flux,
@@ -1134,17 +1118,17 @@ mod python_bindings {
             let dict = PyDict::new(py);
 
             let params = PyDict::new(py);
-            let raw_params = PyDict::new(py);
-            for (filt_idx, filt) in FILTERS.iter().enumerate() {
-                for (p_idx, pname) in PARAM_NAMES.iter().enumerate() {
-                    let idx = filt_idx * N_BASE + p_idx;
-                    let key = format!("{}_{}", pname, filt);
-                    params.set_item(&key, result.phys_params[idx])?;
-                    raw_params.set_item(&key, result.raw_params[idx])?;
-                }
+            for (key, val) in result.params.to_named_map() {
+                params.set_item(key, val)?;
             }
             dict.set_item("params", params)?;
-            dict.set_item("raw_params", raw_params)?;
+
+            let params_unnorm = PyDict::new(py);
+            for (key, val) in result.params_unnorm.to_named_map() {
+                params_unnorm.set_item(key, val)?;
+            }
+            dict.set_item("params_unnorm", params_unnorm)?;
+            dict.set_item("peak_flux", result.peak_flux)?;
             dict.set_item("reduced_chi2", result.reduced_chi2)?;
             dict.set_item("orig_size", result.orig_size)?;
 
@@ -1271,17 +1255,17 @@ mod python_bindings {
 
                     let dict = PyDict::new(py);
                     let params = PyDict::new(py);
-                    let raw_params = PyDict::new(py);
-                    for (filt_idx, filt) in FILTERS.iter().enumerate() {
-                        for (p_idx, pname) in PARAM_NAMES.iter().enumerate() {
-                            let idx = filt_idx * N_BASE + p_idx;
-                            let key = format!("{}_{}", pname, filt);
-                            params.set_item(&key, res.phys_params[idx])?;
-                            raw_params.set_item(&key, res.raw_params[idx])?;
-                        }
+                    for (key, val) in res.params.to_named_map() {
+                        params.set_item(key, val)?;
                     }
                     dict.set_item("params", params)?;
-                    dict.set_item("raw_params", raw_params)?;
+
+                    let params_unnorm = PyDict::new(py);
+                    for (key, val) in res.params_unnorm.to_named_map() {
+                        params_unnorm.set_item(key, val)?;
+                    }
+                    dict.set_item("params_unnorm", params_unnorm)?;
+                    dict.set_item("peak_flux", res.peak_flux)?;
                     dict.set_item("reduced_chi2", res.reduced_chi2)?;
                     out_list.append(dict)?;
                 }

@@ -11,8 +11,8 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
 use crate::{
-    offsets_to_absolute, preprocess, reduced_chi2, to_physical, build_param_map,
-    BandIndices, PreprocessedData, PriorArrays, PsoConfig,
+    preprocess, reduced_chi2, to_physical, build_param_map,
+    BandIndices, FitResult, Obs, PreprocessedData, PriorArrays, PsoConfig, VillarParams,
     N_PARAMS,
 };
 
@@ -205,18 +205,6 @@ pub struct GpuContext {
     _device: i32,
 }
 
-/// Result for one source from batch PSO.
-#[derive(Debug, Clone)]
-pub struct BatchPsoResult {
-    /// Best raw parameters (14 values: r-band + g-band offsets).
-    pub raw_params: [f64; N_PARAMS],
-    /// Physical parameters (14 values, exponentiated where needed).
-    pub phys_params: [f64; N_PARAMS],
-    /// Reduced chi-squared.
-    pub reduced_chi2: f64,
-    /// PSO cost (includes priors + band balancing).
-    pub cost: f64,
-}
 
 // Safety: GpuContext is just a device ID. Each method calls cudaSetDevice
 // before any CUDA work, so it is safe to Send across threads.
@@ -251,7 +239,7 @@ impl GpuContext {
         sources: &[S],
         config: &PsoConfig,
         seed: u64,
-    ) -> Result<Vec<BatchPsoResult>, String> {
+    ) -> Result<Vec<FitResult>, String> {
         // Ensure this thread is bound to the correct GPU device
         cuda_check(unsafe { cudaSetDevice(self._device) })?;
 
@@ -466,24 +454,31 @@ impl GpuContext {
         }
 
         // Collect results from CPU-side gbest arrays
-        let results: Vec<BatchPsoResult> = (0..n_sources)
+        let results: Vec<FitResult> = (0..n_sources)
             .map(|s| {
                 let gb = s * dim;
                 let mut raw = [0.0f64; N_PARAMS];
                 raw.copy_from_slice(&h_gbest_pos[gb..gb + dim]);
 
-                let abs_raw = offsets_to_absolute(&raw);
                 let phys = to_physical(&raw, &priors);
 
                 let d = &sources[s].as_ref().data;
                 let param_map = build_param_map(&d.obs);
                 let rchi2 = reduced_chi2(&raw, &d.obs, &param_map, d.orig_size, &priors);
 
-                BatchPsoResult {
-                    raw_params: abs_raw,
-                    phys_params: phys,
+                let params = VillarParams::from_phys(&phys);
+                let real_obs: Vec<Obs> = d.obs.iter()
+                    .filter(|o| o.phase < 999.0 && o.flux_err < 999.0)
+                    .cloned()
+                    .collect();
+
+                FitResult {
+                    params,
+                    params_unnorm: params.unnormalized(d.peak_flux),
+                    peak_flux: d.peak_flux,
                     reduced_chi2: rchi2,
-                    cost: h_gbest_cost[s],
+                    orig_size: d.orig_size,
+                    obs: real_obs,
                 }
             })
             .collect();
@@ -498,16 +493,16 @@ impl GpuContext {
         data: &GpuBatchData,
         sources: &[S],
         config: &PsoConfig,
-    ) -> Result<Vec<BatchPsoResult>, String> {
+    ) -> Result<Vec<FitResult>, String> {
         let seeds: [u64; 3] = [42, 137, 271];
-        let mut best: Option<Vec<BatchPsoResult>> = None;
+        let mut best: Option<Vec<FitResult>> = None;
 
         for &seed in &seeds {
             let results = self.batch_pso(data, sources, config, seed)?;
             best = Some(match best {
                 None => results,
                 Some(prev) => prev.into_iter().zip(results).map(|(a, b)| {
-                    if b.cost < a.cost { b } else { a }
+                    if b.reduced_chi2 < a.reduced_chi2 { b } else { a }
                 }).collect(),
             });
         }
