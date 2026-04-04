@@ -1,7 +1,7 @@
 use crate::{FitResult, PsoConfig};
 
 #[cfg(target_os = "macos")]
-use crate::{PriorArrays, N_PARAMS};
+use crate::{PriorArrays, MULTI_SEEDS, N_PARAMS};
 
 #[cfg(target_os = "macos")]
 use super::host_shared::{
@@ -258,10 +258,9 @@ mod imp {
             sources: &[S],
             config: &PsoConfig,
         ) -> Result<Vec<FitResult>, String> {
-            let seeds: [u64; 3] = [42, 137, 271];
             let mut best: Option<Vec<FitResult>> = None;
 
-            for &seed in &seeds {
+            for &seed in &MULTI_SEEDS {
                 let results = self.batch_pso(data, sources, config, seed)?;
                 best = merge_best_results(best, results);
             }

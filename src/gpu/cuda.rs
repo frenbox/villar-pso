@@ -4,7 +4,7 @@ use std::ffi::c_int;
 use std::mem::size_of;
 use std::ptr;
 
-use crate::{FitResult, PriorArrays, PsoConfig, N_PARAMS};
+use crate::{FitResult, PriorArrays, PsoConfig, MULTI_SEEDS, N_PARAMS};
 
 use super::host_shared::{
     collect_fit_results, merge_best_results, pack_host_batch, run_host_pso_loop, HostPsoContext,
@@ -295,10 +295,9 @@ impl CudaContext {
         sources: &[S],
         config: &PsoConfig,
     ) -> Result<Vec<FitResult>, String> {
-        let seeds: [u64; 3] = [42, 137, 271];
         let mut best: Option<Vec<FitResult>> = None;
 
-        for &seed in &seeds {
+        for &seed in &MULTI_SEEDS {
             let results = self.batch_pso(data, sources, config, seed)?;
             best = merge_best_results(best, results);
         }

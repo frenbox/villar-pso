@@ -6,11 +6,16 @@
 //!
 //! Usage: metal-scaling-bench [data_dir]
 
+#[path = "common/fit_stats.rs"]
+mod fit_stats;
+
 use std::time::Instant;
 
 use rayon::prelude::*;
 use villar_pso::gpu::{detect_gpu_count_for_backend, load_sources, GpuBackend, GpuContext};
 use villar_pso::PsoConfig;
+
+use fit_stats::compute_fit_stats;
 
 const CHUNK_SIZE: usize = 500;
 
@@ -64,28 +69,21 @@ fn main() {
     match result {
         Ok(chunk_results) => {
             let total_ms = t_start.elapsed().as_secs_f64() * 1000.0;
-            let mut chi2_vals: Vec<f64> = chunk_results.into_iter().flatten().collect();
-            let n_ok = chi2_vals.len();
-            let n_fail = n_sources - n_ok;
-            let per_source = total_ms / n_ok.max(1) as f64;
-
-            let (chi2_mean, chi2_med, chi2_std) = if n_ok > 0 {
-                let mean = chi2_vals.iter().sum::<f64>() / n_ok as f64;
-                let var = chi2_vals.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n_ok as f64;
-                chi2_vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                let med = if n_ok % 2 == 0 {
-                    (chi2_vals[n_ok / 2 - 1] + chi2_vals[n_ok / 2]) / 2.0
-                } else {
-                    chi2_vals[n_ok / 2]
-                };
-                (mean, med, var.sqrt())
-            } else {
-                (f64::NAN, f64::NAN, f64::NAN)
-            };
+            let stats = compute_fit_stats(
+                chunk_results.into_iter().flatten().collect(),
+                n_sources,
+                total_ms,
+            );
 
             eprintln!(
                 "metal benchmark complete: total_ms={:.1} ms/source={:.2} n_ok={} n_fail={} chi2_mean={:.3} chi2_med={:.3} chi2_std={:.3}",
-                total_ms, per_source, n_ok, n_fail, chi2_mean, chi2_med, chi2_std,
+                total_ms,
+                stats.per_source_ms,
+                stats.n_ok,
+                stats.n_fail,
+                stats.chi2_mean,
+                stats.chi2_med,
+                stats.chi2_std,
             );
         }
         Err(err) => {

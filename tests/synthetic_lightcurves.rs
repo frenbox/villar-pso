@@ -8,7 +8,7 @@ use rand::{Rng, SeedableRng};
 
 use villar_pso::{
     build_param_map, preprocess, pso_cost, pso_minimize, reduced_chi2, villar_flux_at, Band,
-    BandIndices, Obs, PhotometryMag, PriorArrays, PsoConfig, N_PARAMS, VILLAR_BANDS,
+    BandIndices, Obs, PhotometryMag, PriorArrays, PsoConfig, MULTI_SEEDS, N_PARAMS, VILLAR_BANDS,
 };
 
 #[cfg(feature = "cuda")]
@@ -183,7 +183,6 @@ fn fit_sparse_csv(path: &str) -> Result<f64, String> {
         ..PsoConfig::default()
     };
 
-    let seeds = [42_u64, 137_u64, 271_u64];
     let mut best_params = [0.0; N_PARAMS];
     let mut best_cost = f64::INFINITY;
     let mut first_cost = f64::INFINITY;
@@ -200,7 +199,7 @@ fn fit_sparse_csv(path: &str) -> Result<f64, String> {
         )
     };
 
-    for (i, &seed) in seeds.iter().enumerate() {
+    for (i, &seed) in MULTI_SEEDS.iter().enumerate() {
         if i >= 2 && (first_cost - best_cost).abs() < 0.05 * best_cost.abs().max(1e-10) {
             break;
         }

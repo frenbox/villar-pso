@@ -28,6 +28,7 @@ pub const PARAM_NAMES: [&str; 7] = [
 
 pub const N_BASE: usize = 7;
 pub const N_PARAMS: usize = 14; // 7 r + 7 g
+pub const MULTI_SEEDS: [u64; 3] = [42, 137, 271];
 
 pub const FILTERS: [&str; 2] = ["ZTF_r", "ZTF_g"];
 
@@ -1016,7 +1017,6 @@ fn fit_preprocessed(data: PreprocessedData) -> Result<FitResult, String> {
     let config = PsoConfig::default();
     let band_indices = BandIndices::new(&data.obs, data.orig_size);
 
-    let seeds: [u64; 3] = [42, 137, 271];
     let mut best_params = [0.0; N_PARAMS];
     let mut best_cost = f64::INFINITY;
     let mut first_cost = f64::INFINITY;
@@ -1033,7 +1033,7 @@ fn fit_preprocessed(data: PreprocessedData) -> Result<FitResult, String> {
         )
     };
 
-    for (i, &seed) in seeds.iter().enumerate() {
+    for (i, &seed) in MULTI_SEEDS.iter().enumerate() {
         if i >= 2 && (first_cost - best_cost).abs() < 0.05 * best_cost.abs().max(1e-10) {
             break;
         }
