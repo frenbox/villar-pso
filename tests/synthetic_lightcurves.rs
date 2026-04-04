@@ -324,7 +324,7 @@ fn synthetic_good_curve_fits_better_than_bad_curve_gpu_cuda() {
 
 #[cfg(feature = "metal")]
 #[test]
-fn synthetic_metal_backend_returns_not_implemented_yet() {
+fn synthetic_metal_backend_smoke() {
     use villar_pso::gpu::{GpuBackend, GpuContext, SourceData};
 
     let path = temp_csv_path("metal_stub");
@@ -339,14 +339,35 @@ fn synthetic_metal_backend_returns_not_implemented_yet() {
 
     let ctx = GpuContext::new_with_backend(0, GpuBackend::Metal)
         .expect("metal context construction should succeed");
-    let err = ctx
-        .pack_batch(&source_refs)
-        .expect_err("metal backend should be stubbed for now");
+
+    #[cfg(target_os = "macos")]
+    {
+        let batch = ctx
+            .pack_batch(&source_refs)
+            .expect("metal batch packing should work on macOS");
+        let config = PsoConfig {
+            n_particles: 24,
+            max_iters: 80,
+            stall_iters: 20,
+            ..PsoConfig::default()
+        };
+        let results = ctx
+            .batch_pso_multi_seed(&batch, &source_refs, &config)
+            .expect("metal pso should run on macOS");
+        assert!(results[0].reduced_chi2.is_finite());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let err = match ctx.pack_batch(&source_refs) {
+            Ok(_) => panic!("metal backend should be unavailable on non-macOS"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("requires macOS") || err.contains("not implemented"),
+            "expected non-macOS metal error, got: {err}"
+        );
+    }
 
     let _ = fs::remove_file(&path);
-
-    assert!(
-        err.contains("not implemented yet"),
-        "expected not implemented error, got: {err}"
-    );
 }

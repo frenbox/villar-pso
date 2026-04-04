@@ -1,5 +1,8 @@
 use crate::{preprocess, FitResult, PreprocessedData, PsoConfig};
 
+#[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+mod host_shared;
+
 #[cfg(feature = "cuda")]
 mod cuda;
 #[cfg(feature = "metal")]

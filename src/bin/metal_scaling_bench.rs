@@ -1,7 +1,8 @@
 //! Metal scaling benchmark scaffold.
 //!
 //! Mirrors the CUDA scaling bench structure but uses the explicit Metal backend.
-//! The backend is currently a stub and will report "not implemented yet".
+//! On macOS, this exercises the Metal kernel path.
+//! On non-macOS hosts, the backend reports unsupported-platform errors.
 //!
 //! Usage: metal-scaling-bench [data_dir]
 
@@ -89,8 +90,8 @@ fn main() {
         }
         Err(err) => {
             eprintln!("Metal benchmark backend status: {}", err);
-            if err.contains("not implemented yet") {
-                eprintln!("Metal kernel path is scaffolded but not implemented yet.");
+            if err.contains("not implemented yet") || err.contains("requires macOS") {
+                eprintln!("Metal backend is only available on macOS hosts.");
                 std::process::exit(2);
             }
             std::process::exit(1);
