@@ -10,15 +10,18 @@
 //!
 //! Usage: cpu-dispatch-bench [data_dir]
 
-use std::time::Instant;
 use rayon::prelude::*;
+use std::time::Instant;
 use villar_pso::fit_lightcurve;
 
 const BATCH_SIZE: usize = 500;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let data_dir = args.get(1).map(|s| s.as_str()).unwrap_or("../data/photometry");
+    let data_dir = args
+        .get(1)
+        .map(|s| s.as_str())
+        .unwrap_or("../data/photometry");
 
     let mut csvs: Vec<String> = std::fs::read_dir(data_dir)
         .expect("Cannot read data directory")
@@ -46,8 +49,16 @@ fn main() {
     eprintln!("=== Strategy A: Sequential dispatch (par_iter, 1 file at a time) ===\n");
     eprintln!(
         "{:>9}  {:>12}  {:>10}  {:>10}  {:>10}  {:>8}  {:>8}  {:>10}  {:>10}  {:>10}",
-        "threads", "total_srcs", "total_ms", "ms/source", "speedup",
-        "n_ok", "n_fail", "chi2_mean", "chi2_med", "chi2_std"
+        "threads",
+        "total_srcs",
+        "total_ms",
+        "ms/source",
+        "speedup",
+        "n_ok",
+        "n_fail",
+        "chi2_mean",
+        "chi2_med",
+        "chi2_std"
     );
     eprintln!("{}", "-".repeat(115));
 
@@ -86,11 +97,22 @@ fn main() {
     // =====================================================================
     //  B) Batch dispatch — par_chunks(500)
     // =====================================================================
-    eprintln!("\n=== Strategy B: Batch dispatch (par_chunks({}), {} batches) ===\n", BATCH_SIZE, n_batches);
+    eprintln!(
+        "\n=== Strategy B: Batch dispatch (par_chunks({}), {} batches) ===\n",
+        BATCH_SIZE, n_batches
+    );
     eprintln!(
         "{:>9}  {:>12}  {:>10}  {:>10}  {:>10}  {:>8}  {:>8}  {:>10}  {:>10}  {:>10}",
-        "threads", "total_srcs", "total_ms", "ms/source", "speedup",
-        "n_ok", "n_fail", "chi2_mean", "chi2_med", "chi2_std"
+        "threads",
+        "total_srcs",
+        "total_ms",
+        "ms/source",
+        "speedup",
+        "n_ok",
+        "n_fail",
+        "chi2_mean",
+        "chi2_med",
+        "chi2_std"
     );
     eprintln!("{}", "-".repeat(115));
 
@@ -132,7 +154,10 @@ fn main() {
     //  Summary
     // =====================================================================
     eprintln!("\n=== Comparison (ms/source at each thread count) ===\n");
-    eprintln!("{:>9}  {:>14}  {:>14}  {:>10}", "threads", "sequential", "batch(500)", "winner");
+    eprintln!(
+        "{:>9}  {:>14}  {:>14}  {:>10}",
+        "threads", "sequential", "batch(500)", "winner"
+    );
     eprintln!("{}", "-".repeat(52));
 
     // Re-run quickly just to collect the paired numbers — but we already
@@ -169,5 +194,12 @@ fn compute_stats(results: &[Option<f64>], n_files: usize, total_ms: f64) -> Stat
         (f64::NAN, f64::NAN, f64::NAN)
     };
 
-    Stats { n_ok, n_fail, per_source, chi2_mean, chi2_med, chi2_std }
+    Stats {
+        n_ok,
+        n_fail,
+        per_source,
+        chi2_mean,
+        chi2_med,
+        chi2_std,
+    }
 }

@@ -12,6 +12,7 @@ crate-type = ["cdylib", "rlib"]
 default = []
 python = ["pyo3"]
 cuda = ["cc"]
+metal = []
 
 [dependencies]
 csv = "1.3"
@@ -31,6 +32,11 @@ path = "src/bin/cpu_dispatch_bench.rs"
 name = "gpu-scaling-bench"
 path = "src/bin/gpu_scaling_bench.rs"
 required-features = ["cuda"]
+
+[[bin]]
+name = "metal-scaling-bench"
+path = "src/bin/metal_scaling_bench.rs"
+required-features = ["metal"]
 
 [profile.release]
 lto = "fat"

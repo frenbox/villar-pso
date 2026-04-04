@@ -1,7 +1,4 @@
-//! GPU-accelerated batch PSO for the joint two-band Villar model.
-//!
-//! The cost function (model eval + band-balanced likelihood + priors) runs on
-//! the GPU. The swarm update loop runs on the CPU.
+//! CUDA backend for batch PSO.
 
 use std::ffi::c_int;
 use std::mem::size_of;
@@ -11,14 +8,11 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
 use crate::{
-    preprocess, reduced_chi2, to_physical, build_param_map,
-    BandIndices, FitResult, Obs, PreprocessedData, PriorArrays, PsoConfig, VillarParams,
-    N_PARAMS,
+    build_param_map, reduced_chi2, to_physical, BandIndices, FitResult, Obs, PriorArrays,
+    PsoConfig, VillarParams, N_PARAMS,
 };
 
-// ---------------------------------------------------------------------------
-// CUDA FFI
-// ---------------------------------------------------------------------------
+use super::SourceData;
 
 type CudaResult = c_int;
 
@@ -30,6 +24,7 @@ extern "C" {
     fn cudaDeviceSynchronize() -> CudaResult;
     fn cudaGetLastError() -> CudaResult;
     fn cudaGetErrorString(error: CudaResult) -> *const i8;
+    fn cudaGetDeviceCount(count: *mut i32) -> i32;
 }
 
 const CUDA_MEMCPY_HOST_TO_DEVICE: c_int = 1;
@@ -54,12 +49,7 @@ extern "C" {
         grid: c_int,
         block: c_int,
     );
-
 }
-
-// ---------------------------------------------------------------------------
-// Safe wrappers
-// ---------------------------------------------------------------------------
 
 fn cuda_check(code: CudaResult) -> Result<(), String> {
     if code == 0 {
@@ -70,9 +60,7 @@ fn cuda_check(code: CudaResult) -> Result<(), String> {
             if ptr.is_null() {
                 "unknown CUDA error".to_string()
             } else {
-                std::ffi::CStr::from_ptr(ptr)
-                    .to_string_lossy()
-                    .into_owned()
+                std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned()
             }
         };
         Err(format!("CUDA error {}: {}", code, msg))
@@ -85,8 +73,6 @@ struct DevBuf {
     size: usize,
 }
 
-// Safety: CUDA device pointers can be used from any host thread provided
-// cudaSetDevice is called first. GpuContext::set_device / batch_pso handle this.
 unsafe impl Send for DevBuf {}
 
 impl DevBuf {
@@ -100,7 +86,12 @@ impl DevBuf {
         let bytes = data.len() * size_of::<T>();
         let buf = Self::alloc(bytes)?;
         cuda_check(unsafe {
-            cudaMemcpy(buf.ptr, data.as_ptr() as *const u8, bytes, CUDA_MEMCPY_HOST_TO_DEVICE)
+            cudaMemcpy(
+                buf.ptr,
+                data.as_ptr() as *const u8,
+                bytes,
+                CUDA_MEMCPY_HOST_TO_DEVICE,
+            )
         })?;
         Ok(buf)
     }
@@ -108,40 +99,38 @@ impl DevBuf {
     fn download_into<T>(&self, host: &mut [T]) -> Result<(), String> {
         let bytes = host.len() * size_of::<T>();
         cuda_check(unsafe {
-            cudaMemcpy(host.as_mut_ptr() as *mut u8, self.ptr, bytes, CUDA_MEMCPY_DEVICE_TO_HOST)
+            cudaMemcpy(
+                host.as_mut_ptr() as *mut u8,
+                self.ptr,
+                bytes,
+                CUDA_MEMCPY_DEVICE_TO_HOST,
+            )
         })
     }
 
     fn upload_from<T>(&self, data: &[T]) -> Result<(), String> {
         let bytes = data.len() * size_of::<T>();
         cuda_check(unsafe {
-            cudaMemcpy(self.ptr, data.as_ptr() as *const u8, bytes, CUDA_MEMCPY_HOST_TO_DEVICE)
+            cudaMemcpy(
+                self.ptr,
+                data.as_ptr() as *const u8,
+                bytes,
+                CUDA_MEMCPY_HOST_TO_DEVICE,
+            )
         })
     }
 }
 
 impl Drop for DevBuf {
     fn drop(&mut self) {
-        unsafe { cudaFree(self.ptr); }
+        unsafe {
+            cudaFree(self.ptr);
+        }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Batch data
-// ---------------------------------------------------------------------------
-
-/// Preprocessed data for one source, ready for GPU packing.
-pub struct SourceData {
-    pub name: String,
-    pub data: PreprocessedData,
-}
-
-impl AsRef<SourceData> for SourceData {
-    fn as_ref(&self) -> &SourceData { self }
-}
-
-/// Packed observation data resident on the GPU.
-pub struct GpuBatchData {
+/// Packed observation data resident on CUDA.
+pub struct CudaBatchData {
     d_times: DevBuf,
     d_flux: DevBuf,
     d_flux_err_sq: DevBuf,
@@ -149,13 +138,10 @@ pub struct GpuBatchData {
     d_offsets: DevBuf,
     d_n_r: DevBuf,
     d_n_g: DevBuf,
-    pub n_sources: usize,
-    /// Per-source orig_size (for CPU-side reduced_chi2 after PSO).
-    pub h_orig_sizes: Vec<usize>,
+    n_sources: usize,
 }
 
-impl GpuBatchData {
-    /// Pack and upload preprocessed sources to the GPU.
+impl CudaBatchData {
     pub fn new<S: AsRef<SourceData>>(sources: &[S]) -> Result<Self, String> {
         let n_sources = sources.len();
         let mut all_times = Vec::new();
@@ -165,7 +151,6 @@ impl GpuBatchData {
         let mut offsets: Vec<c_int> = Vec::with_capacity(n_sources + 1);
         let mut n_r_vec: Vec<c_int> = Vec::with_capacity(n_sources);
         let mut n_g_vec: Vec<c_int> = Vec::with_capacity(n_sources);
-        let mut h_orig_sizes = Vec::with_capacity(n_sources);
 
         offsets.push(0);
         for src in sources {
@@ -180,7 +165,6 @@ impl GpuBatchData {
             offsets.push(all_times.len() as c_int);
             n_r_vec.push(bi.r_indices.len() as c_int);
             n_g_vec.push(bi.g_indices.len() as c_int);
-            h_orig_sizes.push(d.orig_size);
         }
 
         Ok(Self {
@@ -192,56 +176,159 @@ impl GpuBatchData {
             d_n_r: DevBuf::upload(&n_r_vec)?,
             d_n_g: DevBuf::upload(&n_g_vec)?,
             n_sources,
-            h_orig_sizes,
         })
     }
 }
 
-// ---------------------------------------------------------------------------
-// GPU context + batch PSO
-// ---------------------------------------------------------------------------
+fn init_particles(
+    n_sources: usize,
+    n_particles: usize,
+    dim: usize,
+    seed: u64,
+    priors: &PriorArrays,
+    lower: &[f64; N_PARAMS],
+    upper: &[f64; N_PARAMS],
+    v_max: &[f64],
+) -> (Vec<f64>, Vec<f64>) {
+    let total_particles = n_sources * n_particles;
+    let mut h_positions = vec![0.0f64; total_particles * dim];
+    let mut h_velocities = vec![0.0f64; total_particles * dim];
 
-pub struct GpuContext {
-    _device: i32,
+    let n_seeded = n_particles * 3 / 10;
+    for s in 0..n_sources {
+        let mut rng = SmallRng::seed_from_u64(seed.wrapping_add(s as u64));
+        for p in 0..n_particles {
+            let idx = s * n_particles + p;
+            let base = idx * dim;
+            if p < n_seeded {
+                for d in 0..dim {
+                    let u1: f64 = rng.random::<f64>().max(1e-10);
+                    let u2: f64 = rng.random::<f64>();
+                    let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+                    h_positions[base + d] =
+                        (priors.means[d] + z * priors.stds[d]).clamp(lower[d], upper[d]);
+                }
+            } else {
+                for d in 0..dim {
+                    h_positions[base + d] = lower[d] + rng.random::<f64>() * (upper[d] - lower[d]);
+                }
+            }
+            for d in 0..dim {
+                h_velocities[base + d] = v_max[d] * 0.2 * (2.0 * rng.random::<f64>() - 1.0);
+            }
+        }
+    }
+
+    (h_positions, h_velocities)
 }
 
+fn collect_fit_results<S: AsRef<SourceData>>(
+    sources: &[S],
+    h_gbest_pos: &[f64],
+    dim: usize,
+    priors: &PriorArrays,
+) -> Vec<FitResult> {
+    (0..sources.len())
+        .map(|s| {
+            let gb = s * dim;
+            let mut raw = [0.0f64; N_PARAMS];
+            raw.copy_from_slice(&h_gbest_pos[gb..gb + dim]);
 
-// Safety: GpuContext is just a device ID. Each method calls cudaSetDevice
-// before any CUDA work, so it is safe to Send across threads.
-unsafe impl Send for GpuContext {}
-unsafe impl Sync for GpuContext {}
+            let phys = to_physical(&raw, priors);
+            let d = &sources[s].as_ref().data;
+            let param_map = build_param_map(&d.obs);
+            let rchi2 = reduced_chi2(&raw, &d.obs, &param_map, d.orig_size, priors);
 
-impl GpuContext {
+            let params = VillarParams::from_phys(&phys);
+            let real_obs: Vec<Obs> = d
+                .obs
+                .iter()
+                .filter(|o| o.phase < 999.0 && o.flux_err < 999.0)
+                .cloned()
+                .collect();
+
+            FitResult {
+                params,
+                params_unnorm: params.unnormalized(d.peak_flux),
+                peak_flux: d.peak_flux,
+                reduced_chi2: rchi2,
+                orig_size: d.orig_size,
+                obs: real_obs,
+            }
+        })
+        .collect()
+}
+
+pub struct CudaContext {
+    device: i32,
+}
+
+unsafe impl Send for CudaContext {}
+unsafe impl Sync for CudaContext {}
+
+impl CudaContext {
     pub fn new(device: i32) -> Result<Self, String> {
         cuda_check(unsafe { cudaSetDevice(device) })?;
-        Ok(Self { _device: device })
+        Ok(Self { device })
     }
 
-    /// Bind the calling thread to this context's GPU device.
-    /// Call this before `GpuBatchData::new` when using multi-GPU.
     pub fn set_device(&self) -> Result<(), String> {
-        cuda_check(unsafe { cudaSetDevice(self._device) })
+        cuda_check(unsafe { cudaSetDevice(self.device) })
     }
 
-    /// Device index for this context.
     pub fn device_id(&self) -> i32 {
-        self._device
+        self.device
     }
 
-    /// Run batch PSO for all sources simultaneously on the GPU.
-    ///
-    /// The entire PSO loop (cost eval, velocity/position update, best reduction)
-    /// runs on GPU. Only a small `source_done` array is downloaded each iteration
-    /// for convergence checking.
+    fn evaluate_costs_on_gpu(
+        &self,
+        data: &CudaBatchData,
+        d_positions: &DevBuf,
+        d_costs: &DevBuf,
+        h_positions: &[f64],
+        h_costs: &mut [f64],
+        d_prior_means: &DevBuf,
+        d_prior_stds: &DevBuf,
+        d_logged_mask: &DevBuf,
+        n_sources: usize,
+        n_particles: usize,
+        particle_grid: c_int,
+        block: c_int,
+    ) -> Result<(), String> {
+        d_positions.upload_from(h_positions)?;
+        unsafe {
+            launch_batch_pso_cost_villar_joint(
+                data.d_times.ptr as _,
+                data.d_flux.ptr as _,
+                data.d_flux_err_sq.ptr as _,
+                data.d_band.ptr as _,
+                data.d_offsets.ptr as _,
+                data.d_n_r.ptr as _,
+                data.d_n_g.ptr as _,
+                d_positions.ptr as _,
+                d_costs.ptr as _,
+                d_prior_means.ptr as _,
+                d_prior_stds.ptr as _,
+                d_logged_mask.ptr as _,
+                n_sources as c_int,
+                n_particles as c_int,
+                particle_grid,
+                block,
+            );
+            cuda_check(cudaGetLastError())?;
+            cuda_check(cudaDeviceSynchronize())?;
+        }
+        d_costs.download_into(h_costs)
+    }
+
     pub fn batch_pso<S: AsRef<SourceData>>(
         &self,
-        data: &GpuBatchData,
+        data: &CudaBatchData,
         sources: &[S],
         config: &PsoConfig,
         seed: u64,
     ) -> Result<Vec<FitResult>, String> {
-        // Ensure this thread is bound to the correct GPU device
-        cuda_check(unsafe { cudaSetDevice(self._device) })?;
+        cuda_check(unsafe { cudaSetDevice(self.device) })?;
 
         let n_sources = data.n_sources;
         let dim = N_PARAMS;
@@ -250,7 +337,6 @@ impl GpuContext {
 
         let priors = PriorArrays::new();
 
-        // Upload prior arrays for GPU cost kernel
         let prior_means: Vec<f64> = priors.means.to_vec();
         let prior_stds: Vec<f64> = priors.stds.to_vec();
         let logged_mask: Vec<c_int> = priors.logged.iter().map(|&b| b as c_int).collect();
@@ -258,7 +344,6 @@ impl GpuContext {
         let d_prior_stds = DevBuf::upload(&prior_stds)?;
         let d_logged_mask = DevBuf::upload(&logged_mask)?;
 
-        // PSO bounds and velocity clamp (CPU-side only)
         let lower: [f64; N_PARAMS] = priors.mins;
         let upper: [f64; N_PARAMS] = priors.maxs;
         let v_max: Vec<f64> = (0..dim).map(|d| 0.5 * (upper[d] - lower[d])).collect();
@@ -269,49 +354,22 @@ impl GpuContext {
         let c2 = config.c2;
         let inv_max_iters = 1.0 / config.max_iters as f64;
 
-        // Initialize particles on CPU
-        let mut h_positions = vec![0.0f64; total_particles * dim];
-        let mut h_velocities = vec![0.0f64; total_particles * dim];
+        let (mut h_positions, mut h_velocities) = init_particles(
+            n_sources,
+            n_particles,
+            dim,
+            seed,
+            &priors,
+            &lower,
+            &upper,
+            &v_max,
+        );
 
-        let n_seeded = n_particles * 3 / 10;
-        for s in 0..n_sources {
-            let mut rng = SmallRng::seed_from_u64(seed.wrapping_add(s as u64));
-            for p in 0..n_particles {
-                let idx = s * n_particles + p;
-                let base = idx * dim;
-                if p < n_seeded {
-                    for d in 0..dim {
-                        let u1: f64 = rng.random::<f64>().max(1e-10);
-                        let u2: f64 = rng.random::<f64>();
-                        let z = (-2.0 * u1.ln()).sqrt()
-                            * (2.0 * std::f64::consts::PI * u2).cos();
-                        h_positions[base + d] =
-                            (priors.means[d] + z * priors.stds[d]).clamp(lower[d], upper[d]);
-                    }
-                } else {
-                    for d in 0..dim {
-                        h_positions[base + d] =
-                            lower[d] + rng.random::<f64>() * (upper[d] - lower[d]);
-                    }
-                }
-                for d in 0..dim {
-                    h_velocities[base + d] =
-                        v_max[d] * 0.2 * (2.0 * rng.random::<f64>() - 1.0);
-                }
-            }
-        }
-
-        // Allocate all GPU buffers (persist for entire PSO loop)
-        // GPU buffers: only positions (uploaded each iter) and costs (downloaded each iter)
         let d_positions = DevBuf::alloc(total_particles * dim * size_of::<f64>())?;
         let d_costs = DevBuf::alloc(total_particles * size_of::<f64>())?;
 
         let block: c_int = 256;
         let particle_grid: c_int = ((total_particles as c_int) + block - 1) / block;
-
-        // Hybrid approach: GPU evaluates cost, CPU handles PSO dynamics.
-        // This gives us the CPU's proven restart/exploration strategy
-        // while offloading the expensive cost function to GPU.
 
         let mut h_pbest_pos = h_positions.clone();
         let mut h_pbest_cost = vec![f64::INFINITY; total_particles];
@@ -319,7 +377,6 @@ impl GpuContext {
         let mut h_gbest_cost = vec![f64::INFINITY; n_sources];
         let mut h_costs = vec![0.0f64; total_particles];
 
-        // Per-source stall tracking
         let mut prev_gbest = vec![f64::INFINITY; n_sources];
         let mut stall_count = vec![0usize; n_sources];
         let mut source_done = vec![false; n_sources];
@@ -332,29 +389,27 @@ impl GpuContext {
         for iter in 0..config.max_iters {
             let w = w_start - (w_start - w_end) * (iter as f64) * inv_max_iters;
 
-            // 1. Upload positions, evaluate costs on GPU
-            d_positions.upload_from(&h_positions)?;
-            unsafe {
-                launch_batch_pso_cost_villar_joint(
-                    data.d_times.ptr as _, data.d_flux.ptr as _,
-                    data.d_flux_err_sq.ptr as _, data.d_band.ptr as _,
-                    data.d_offsets.ptr as _, data.d_n_r.ptr as _, data.d_n_g.ptr as _,
-                    d_positions.ptr as _, d_costs.ptr as _,
-                    d_prior_means.ptr as _, d_prior_stds.ptr as _, d_logged_mask.ptr as _,
-                    n_sources as c_int, n_particles as c_int,
-                    particle_grid, block,
-                );
-                cuda_check(cudaGetLastError())?;
-                cuda_check(cudaDeviceSynchronize())?;
-            }
-            d_costs.download_into(&mut h_costs)?;
+            self.evaluate_costs_on_gpu(
+                data,
+                &d_positions,
+                &d_costs,
+                &h_positions,
+                &mut h_costs,
+                &d_prior_means,
+                &d_prior_stds,
+                &d_logged_mask,
+                n_sources,
+                n_particles,
+                particle_grid,
+                block,
+            )?;
 
-            // 2. CPU: update personal bests, global bests, velocities, positions
             let mut all_done = true;
             for s in 0..n_sources {
-                if source_done[s] { continue; }
+                if source_done[s] {
+                    continue;
+                }
 
-                // Update pbest and gbest
                 for p in 0..n_particles {
                     let idx = s * n_particles + p;
                     let cost = h_costs[idx];
@@ -372,16 +427,13 @@ impl GpuContext {
                     }
                 }
 
-                // Stall detection
-                let improved = prev_gbest[s] - h_gbest_cost[s]
-                    > 1e-4 * prev_gbest[s].abs().max(1e-10);
+                let improved =
+                    prev_gbest[s] - h_gbest_cost[s] > 1e-4 * prev_gbest[s].abs().max(1e-10);
                 if improved {
                     stall_count[s] = 0;
                     prev_gbest[s] = h_gbest_cost[s];
                 } else {
                     stall_count[s] += 1;
-
-                    // Partial restart: reinitialize worst particles
                     if stall_count[s] % restart_threshold == 0
                         && stall_count[s] < config.stall_iters
                     {
@@ -390,7 +442,8 @@ impl GpuContext {
                         indices.sort_by(|&a, &b| {
                             let ia = s * n_particles + a;
                             let ib = s * n_particles + b;
-                            h_pbest_cost[ib].partial_cmp(&h_pbest_cost[ia])
+                            h_pbest_cost[ib]
+                                .partial_cmp(&h_pbest_cost[ia])
                                 .unwrap_or(std::cmp::Ordering::Equal)
                         });
                         for (ri, &p) in indices.iter().take(n_restart).enumerate() {
@@ -405,11 +458,11 @@ impl GpuContext {
                                     h_positions[base + d] = (priors.means[d] + z * priors.stds[d])
                                         .clamp(lower[d], upper[d]);
                                 } else {
-                                    h_positions[base + d] = lower[d]
-                                        + rng.random::<f64>() * (upper[d] - lower[d]);
+                                    h_positions[base + d] =
+                                        lower[d] + rng.random::<f64>() * (upper[d] - lower[d]);
                                 }
-                                h_velocities[base + d] = (upper[d] - lower[d])
-                                    * 0.1 * (2.0 * rng.random::<f64>() - 1.0);
+                                h_velocities[base + d] =
+                                    (upper[d] - lower[d]) * 0.1 * (2.0 * rng.random::<f64>() - 1.0);
                             }
                             h_pbest_cost[idx] = f64::INFINITY;
                         }
@@ -422,8 +475,6 @@ impl GpuContext {
 
                 if !source_done[s] {
                     all_done = false;
-
-                    // Update velocities and positions
                     for p in 0..n_particles {
                         let idx = s * n_particles + p;
                         let base = idx * dim;
@@ -450,47 +501,17 @@ impl GpuContext {
                     }
                 }
             }
-            if all_done { break; }
+            if all_done {
+                break;
+            }
         }
 
-        // Collect results from CPU-side gbest arrays
-        let results: Vec<FitResult> = (0..n_sources)
-            .map(|s| {
-                let gb = s * dim;
-                let mut raw = [0.0f64; N_PARAMS];
-                raw.copy_from_slice(&h_gbest_pos[gb..gb + dim]);
-
-                let phys = to_physical(&raw, &priors);
-
-                let d = &sources[s].as_ref().data;
-                let param_map = build_param_map(&d.obs);
-                let rchi2 = reduced_chi2(&raw, &d.obs, &param_map, d.orig_size, &priors);
-
-                let params = VillarParams::from_phys(&phys);
-                let real_obs: Vec<Obs> = d.obs.iter()
-                    .filter(|o| o.phase < 999.0 && o.flux_err < 999.0)
-                    .cloned()
-                    .collect();
-
-                FitResult {
-                    params,
-                    params_unnorm: params.unnormalized(d.peak_flux),
-                    peak_flux: d.peak_flux,
-                    reduced_chi2: rchi2,
-                    orig_size: d.orig_size,
-                    obs: real_obs,
-                }
-            })
-            .collect();
-
-        Ok(results)
+        Ok(collect_fit_results(sources, &h_gbest_pos, dim, &priors))
     }
 
-    /// Run batch PSO with multiple seeds (matching CPU's 3-seed strategy).
-    /// Returns the best result per source across all seeds.
     pub fn batch_pso_multi_seed<S: AsRef<SourceData>>(
         &self,
-        data: &GpuBatchData,
+        data: &CudaBatchData,
         sources: &[S],
         config: &PsoConfig,
     ) -> Result<Vec<FitResult>, String> {
@@ -501,46 +522,29 @@ impl GpuContext {
             let results = self.batch_pso(data, sources, config, seed)?;
             best = Some(match best {
                 None => results,
-                Some(prev) => prev.into_iter().zip(results).map(|(a, b)| {
-                    if b.reduced_chi2 < a.reduced_chi2 { b } else { a }
-                }).collect(),
+                Some(prev) => prev
+                    .into_iter()
+                    .zip(results)
+                    .map(|(a, b)| {
+                        if b.reduced_chi2 < a.reduced_chi2 {
+                            b
+                        } else {
+                            a
+                        }
+                    })
+                    .collect(),
             });
         }
         Ok(best.unwrap())
     }
 }
 
-// ---------------------------------------------------------------------------
-// Convenience: load a directory of CSVs and run batch GPU PSO
-// ---------------------------------------------------------------------------
-
-/// Load all CSVs from a directory, preprocess them, and return source data.
-/// Sources that fail preprocessing are skipped (with a warning on stderr).
-pub fn load_sources(data_dir: &str) -> Vec<SourceData> {
-    let mut entries: Vec<_> = std::fs::read_dir(data_dir)
-        .expect("Cannot read data directory")
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .map_or(false, |ext| ext == "csv")
-        })
-        .collect();
-    entries.sort_by_key(|e| e.path());
-
-    let mut sources = Vec::new();
-    for entry in entries {
-        let path = entry.path();
-        let name = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("?")
-            .to_string();
-        let csv_path = path.to_string_lossy().to_string();
-        match preprocess(&csv_path) {
-            Ok(data) => sources.push(SourceData { name, data }),
-            Err(e) => eprintln!("SKIP {}: {}", name, e),
-        }
+pub fn detect_gpu_count() -> usize {
+    let mut count: i32 = 0;
+    let err = unsafe { cudaGetDeviceCount(&mut count) };
+    if err != 0 || count < 1 {
+        1
+    } else {
+        count as usize
     }
-    sources
 }
