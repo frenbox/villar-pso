@@ -8,6 +8,17 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use std::collections::HashMap;
 
+#[cfg(all(feature = "cuda", feature = "metal"))]
+compile_error!(
+    "Features 'cuda' and 'metal' are mutually exclusive. Enable exactly one GPU backend."
+);
+
+#[cfg(all(feature = "cuda", target_os = "macos"))]
+compile_error!("Feature 'cuda' is not supported on macOS in this crate. Use feature 'metal'.");
+
+#[cfg(all(feature = "metal", not(target_os = "macos")))]
+compile_error!("Feature 'metal' requires a macOS target.");
+
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub mod gpu;
 

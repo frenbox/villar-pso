@@ -5,8 +5,14 @@ Joint two-band Villar light-curve fitter using Particle Swarm Optimisation (PSO)
 Backends:
 
 * CPU (default)
-* CUDA (`feature = "cuda"`)
-* Metal (`feature = "metal"`)
+* CUDA (`feature = "cuda"`, non-macOS targets)
+* Metal (`feature = "metal"`, macOS only)
+
+Backend feature policy:
+
+* `cuda` and `metal` are mutually exclusive.
+* `cuda` is rejected for macOS targets.
+* `metal` is rejected for non-macOS targets.
 
 ## Installation
 
@@ -27,7 +33,7 @@ Requirements:
 
 * NVIDIA GPU and drivers
 * CUDA toolkit
-* `nvcc` available on PATH (or via `CUDA_HOME`)
+* `nvcc` available on PATH (build fails with a clear error if not found)
 
 ### Metal (macOS)
 
@@ -63,8 +69,8 @@ GPU API is under `villar_pso::gpu`:
 
 Backend selection notes:
 
-* If both `cuda` and `metal` are enabled at compile time, `GpuContext::new(...)` defaults to CUDA.
-* Metal backend implementation is macOS-only; non-macOS builds return a clear runtime error for Metal operations.
+* Exactly one GPU backend feature may be enabled.
+* `GpuContext::new(...)` selects the enabled backend for the build.
 
 ## Multi-Seed Strategy
 
@@ -129,7 +135,6 @@ Common test commands:
 cargo test
 cargo test --features metal
 cargo test --features cuda
-cargo test --features "cuda metal"
 ```
 
 Notes:

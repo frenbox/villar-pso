@@ -1,5 +1,9 @@
 #[cfg(feature = "cuda")]
 fn build_cuda() {
+    if let Err(msg) = ensure_nvcc_available() {
+        fail_build(&msg);
+    }
+
     let ccbin = std::env::var("NVCC_CCBIN").ok().or_else(|| {
         let candidate = "/usr/bin/g++-12";
         if std::path::Path::new(candidate).exists() {
@@ -38,6 +42,40 @@ fn build_cuda() {
 
     println!("cargo:rustc-link-lib=cudart");
     println!("cargo:rerun-if-changed=cuda/villar_joint.cu");
+}
+
+#[cfg(feature = "cuda")]
+fn ensure_nvcc_available() -> Result<(), String> {
+    let output = std::process::Command::new("nvcc").arg("--version").output();
+
+    match output {
+        Ok(result) if result.status.success() => Ok(()),
+        Ok(result) => {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            let detail = stderr.trim();
+            if detail.is_empty() {
+                Err(format!(
+                    "CUDA feature is enabled, but 'nvcc --version' failed with status {}. \
+                     Ensure the CUDA toolkit is installed and nvcc is on PATH.",
+                    result.status
+                ))
+            } else {
+                Err(format!(
+                    "CUDA feature is enabled, but nvcc could not be used: {}",
+                    detail
+                ))
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(
+            "CUDA feature is enabled, but 'nvcc' was not found on PATH. \
+             Install the CUDA toolkit or disable the 'cuda' feature for this build."
+                .to_string(),
+        ),
+        Err(e) => Err(format!(
+            "CUDA feature is enabled, but checking nvcc failed: {}",
+            e
+        )),
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -186,7 +224,26 @@ fn format_compute_arch(cap: (u32, u32)) -> String {
     format!("compute_{}{}", cap.0, cap.1)
 }
 
+fn fail_build(msg: &str) -> ! {
+    eprintln!("error: {}", msg);
+    std::process::exit(1);
+}
+
 fn main() {
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_else(|_| "unknown".to_string());
+
+    if cfg!(all(feature = "cuda", feature = "metal")) {
+        fail_build("Features 'cuda' and 'metal' are mutually exclusive. Enable exactly one GPU backend.");
+    }
+
+    if cfg!(feature = "cuda") && target_os == "macos" {
+        fail_build("Feature 'cuda' is not supported on macOS in this crate. Use feature 'metal' on macOS.");
+    }
+
+    if cfg!(feature = "metal") && target_os != "macos" {
+        fail_build("Feature 'metal' requires a macOS target. Disable 'metal' for non-macOS builds.");
+    }
+
     #[cfg(feature = "cuda")]
     build_cuda();
 }
