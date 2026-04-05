@@ -6,26 +6,38 @@
 //!
 //! If --gpus is not given, all visible GPUs are used.
 
-use std::time::Instant;
+#[path = "common/fit_stats.rs"]
+mod fit_stats;
+
 use rayon::prelude::*;
-use villar_pso::gpu::{GpuBatchData, GpuContext, load_sources};
+use std::time::Instant;
+use villar_pso::gpu::{detect_gpu_count, load_sources, GpuContext};
 use villar_pso::PsoConfig;
+
+use fit_stats::compute_fit_stats;
 
 const CHUNK_SIZE: usize = 500;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let data_dir = args.get(1).map(|s| s.as_str()).unwrap_or("../data/photometry");
+    let data_dir = args
+        .get(1)
+        .map(|s| s.as_str())
+        .unwrap_or("../data/photometry");
 
     // Parse --gpus flag
-    let max_gpus: Option<usize> = args.windows(2)
+    let max_gpus: Option<usize> = args
+        .windows(2)
         .find(|w| w[0] == "--gpus")
         .and_then(|w| w[1].parse().ok());
 
     // Detect available GPUs
     let n_gpus_available = detect_gpu_count();
     let n_gpus_max = max_gpus.unwrap_or(n_gpus_available).min(n_gpus_available);
-    eprintln!("GPUs available: {}, max to use: {}", n_gpus_available, n_gpus_max);
+    eprintln!(
+        "GPUs available: {}, max to use: {}",
+        n_gpus_available, n_gpus_max
+    );
 
     // Preprocess all sources up-front
     let t_load = Instant::now();
@@ -48,7 +60,7 @@ fn main() {
     {
         let gpu0 = GpuContext::new(0).expect("Failed to init GPU 0");
         let warm = &sources[..CHUNK_SIZE.min(n_sources)];
-        let batch = GpuBatchData::new(warm).expect("GPU upload failed");
+        let batch = gpu0.pack_batch(warm).expect("GPU upload failed");
         let _ = gpu0.batch_pso_multi_seed(&batch, warm, &config);
     }
 
@@ -88,7 +100,7 @@ fn main() {
                     // Bind this thread to the assigned GPU before allocating
                     gpu.set_device().expect("cudaSetDevice failed");
 
-                    let batch = GpuBatchData::new(chunk).expect("GPU upload failed");
+                    let batch = gpu.pack_batch(chunk).expect("GPU upload failed");
                     let results = gpu
                         .batch_pso_multi_seed(&batch, chunk, &config)
                         .expect("GPU batch PSO failed");
@@ -98,50 +110,21 @@ fn main() {
         });
         let total_ms = t_start.elapsed().as_secs_f64() * 1000.0;
 
-        // Flatten and compute statistics
-        let mut chi2_vals: Vec<f64> = chunk_results.into_iter().flatten().collect();
-        let n_ok = chi2_vals.len();
-        let n_fail = n_sources - n_ok;
-        let per_source = total_ms / n_ok.max(1) as f64;
-
-        let (chi2_mean, chi2_med, chi2_std) = if n_ok > 0 {
-            let mean = chi2_vals.iter().sum::<f64>() / n_ok as f64;
-            let var = chi2_vals.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n_ok as f64;
-            chi2_vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            let med = if n_ok % 2 == 0 {
-                (chi2_vals[n_ok / 2 - 1] + chi2_vals[n_ok / 2]) / 2.0
-            } else {
-                chi2_vals[n_ok / 2]
-            };
-            (mean, med, var.sqrt())
-        } else {
-            (f64::NAN, f64::NAN, f64::NAN)
-        };
+        let stats = compute_fit_stats(
+            chunk_results.into_iter().flatten().collect(),
+            n_sources,
+            total_ms,
+        );
 
         if n_gpus == 1 {
-            baseline_ms_per_source = per_source;
+            baseline_ms_per_source = stats.per_source_ms;
         }
-        let speedup = baseline_ms_per_source / per_source;
+        let speedup = baseline_ms_per_source / stats.per_source_ms;
 
         eprintln!(
             "{:>7}  {:>9}  {:>10}  {:>12}  {:>10.1}  {:>10.2}  {:>10.2}x  {:>8}  {:>8}  {:>10.3}  {:>10.3}  {:>10.3}",
-            n_gpus, n_gpus, CHUNK_SIZE, n_sources, total_ms, per_source, speedup, n_ok, n_fail,
-            chi2_mean, chi2_med, chi2_std,
+            n_gpus, n_gpus, CHUNK_SIZE, n_sources, total_ms, stats.per_source_ms, speedup,
+            stats.n_ok, stats.n_fail, stats.chi2_mean, stats.chi2_med, stats.chi2_std,
         );
-    }
-}
-
-/// Query the number of CUDA-visible GPUs.
-fn detect_gpu_count() -> usize {
-    extern "C" {
-        fn cudaGetDeviceCount(count: *mut i32) -> i32;
-    }
-    let mut count: i32 = 0;
-    let err = unsafe { cudaGetDeviceCount(&mut count) };
-    if err != 0 || count < 1 {
-        eprintln!("Warning: cudaGetDeviceCount failed or returned 0, defaulting to 1");
-        1
-    } else {
-        count as usize
     }
 }

@@ -8,7 +8,18 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use std::collections::HashMap;
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", feature = "metal"))]
+compile_error!(
+    "Features 'cuda' and 'metal' are mutually exclusive. Enable exactly one GPU backend."
+);
+
+#[cfg(all(feature = "cuda", target_os = "macos"))]
+compile_error!("Feature 'cuda' is not supported on macOS in this crate. Use feature 'metal'.");
+
+#[cfg(all(feature = "metal", not(target_os = "macos")))]
+compile_error!("Feature 'metal' requires a macOS target.");
+
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub mod gpu;
 
 // ─── Prior tables (from fit_jax_best.py) ─────────────────────────────────────
@@ -28,6 +39,7 @@ pub const PARAM_NAMES: [&str; 7] = [
 
 pub const N_BASE: usize = 7;
 pub const N_PARAMS: usize = 14; // 7 r + 7 g
+pub const MULTI_SEEDS: [u64; 3] = [42, 137, 271];
 
 pub const FILTERS: [&str; 2] = ["ZTF_r", "ZTF_g"];
 
@@ -36,34 +48,34 @@ pub const FILTERS: [&str; 2] = ["ZTF_r", "ZTF_g"];
 // log10 ranges include ~2 sigma margin beyond observed JAX fits.
 const PRIOR_R: [(f64, f64, f64, f64, bool); 7] = [
     // A:  JAX log10 range [-0.04, 0.01], mean -0.009
-    (-0.20, 0.15, -0.009, 0.100, true),    // A  (phys 0.63–1.41)
-    (-0.01, 0.03, 0.009, 0.010, false),    // beta
+    (-0.20, 0.15, -0.009, 0.100, true), // A  (phys 0.63–1.41)
+    (-0.01, 0.03, 0.009, 0.010, false), // beta
     // gamma: JAX log10 range [1.21, 1.60], mean 1.33
-    (0.80, 2.00, 1.327, 0.400, true),      // gamma (phys 6.3–100)
-    (-50.0, 30.0, -12.0, 15.000, false),   // t_0
+    (0.80, 2.00, 1.327, 0.400, true),    // gamma (phys 6.3–100)
+    (-50.0, 30.0, -12.0, 15.000, false), // t_0
     // tau_rise: JAX log10 range [0.17, 0.49], mean 0.36
-    (-0.30, 1.00, 0.360, 0.350, true),     // tau_rise (phys 0.5–10)
+    (-0.30, 1.00, 0.360, 0.350, true), // tau_rise (phys 0.5–10)
     // tau_fall: JAX log10 range [1.17, 1.87], mean 1.45
-    (0.80, 2.20, 1.454, 0.400, true),      // tau_fall (phys 6.3–158)
-    (-2.50, -0.30, -1.033, 0.500, true),   // extra_sigma
+    (0.80, 2.20, 1.454, 0.400, true),    // tau_fall (phys 6.3–158)
+    (-2.50, -0.30, -1.033, 0.500, true), // extra_sigma
 ];
 
 // g-band: relative offsets from r-band.
 // JAX-calibrated from observed offset distributions.
 const PRIOR_G: [(f64, f64, f64, f64, bool); 7] = [
     // A offset: JAX range [-0.07, +0.04], mean -0.015, std 0.036
-    (-0.30, 0.20, -0.015, 0.080, true),    // A  (keep g close to r)
-    (-0.02, 0.02, -0.001, 0.008, false),   // beta
+    (-0.30, 0.20, -0.015, 0.080, true),  // A  (keep g close to r)
+    (-0.02, 0.02, -0.001, 0.008, false), // beta
     // gamma offset: JAX range [-0.47, +0.09], mean -0.095, std 0.22
-    (-0.80, 0.50, -0.095, 0.250, true),    // gamma
+    (-0.80, 0.50, -0.095, 0.250, true), // gamma
     // t_0 offset: JAX range [-2.3, +0.1], mean -1.18, std 0.86
-    (-5.00, 3.0, -1.181, 1.500, false),    // t_0
+    (-5.00, 3.0, -1.181, 1.500, false), // t_0
     // tau_rise offset: JAX range [-0.63, +0.09], mean -0.195, std 0.28
-    (-1.00, 0.50, -0.195, 0.350, true),    // tau_rise
+    (-1.00, 0.50, -0.195, 0.350, true), // tau_rise
     // tau_fall offset: JAX range [-0.44, -0.22], mean -0.323, std 0.10
-    (-0.80, 0.30, -0.323, 0.250, true),    // tau_fall
+    (-0.80, 0.30, -0.323, 0.250, true), // tau_fall
     // extra_sigma offset: JAX range [-0.29, +0.32], mean -0.025, std 0.23
-    (-0.60, 0.60, -0.025, 0.300, true),    // extra_sigma
+    (-0.60, 0.60, -0.025, 0.300, true), // extra_sigma
 ];
 
 /// Flattened prior arrays: indices 0..7 = r-band, 7..14 = g-band (absolute for g).
@@ -177,10 +189,20 @@ impl VillarParams {
     /// Return as a flat 14-element array in standard order.
     pub fn to_array(&self) -> [f64; N_PARAMS] {
         [
-            self.a_r, self.beta_r, self.gamma_r, self.t_0_r,
-            self.tau_rise_r, self.tau_fall_r, self.extra_sigma_r,
-            self.a_g, self.beta_g, self.gamma_g, self.t_0_g,
-            self.tau_rise_g, self.tau_fall_g, self.extra_sigma_g,
+            self.a_r,
+            self.beta_r,
+            self.gamma_r,
+            self.t_0_r,
+            self.tau_rise_r,
+            self.tau_fall_r,
+            self.extra_sigma_r,
+            self.a_g,
+            self.beta_g,
+            self.gamma_g,
+            self.t_0_g,
+            self.tau_rise_g,
+            self.tau_fall_g,
+            self.extra_sigma_g,
         ]
     }
 
@@ -190,7 +212,10 @@ impl VillarParams {
         let mut map = HashMap::new();
         for (filt_idx, filt) in FILTERS.iter().enumerate() {
             for (p_idx, pname) in PARAM_NAMES.iter().enumerate() {
-                map.insert(format!("{}_{}", pname, filt), arr[filt_idx * N_BASE + p_idx]);
+                map.insert(
+                    format!("{}_{}", pname, filt),
+                    arr[filt_idx * N_BASE + p_idx],
+                );
             }
         }
         map
@@ -341,9 +366,7 @@ pub fn preprocess(csv_path: &str) -> Result<PreprocessedData, String> {
         .clone();
 
     // Determine column indices
-    let col_idx = |name: &str| -> Option<usize> {
-        headers.iter().position(|h| h == name)
-    };
+    let col_idx = |name: &str| -> Option<usize> { headers.iter().position(|h| h == name) };
 
     let has_jd = col_idx("jd").is_some();
     let has_mjd = col_idx("mjd").is_some();
@@ -521,10 +544,7 @@ fn finalize_preprocessing(mut obs: Vec<Obs>) -> Result<PreprocessedData, String>
     }
 
     // Normalise by peak flux
-    let peak = obs
-        .iter()
-        .map(|o| o.flux)
-        .fold(f64::NEG_INFINITY, f64::max);
+    let peak = obs.iter().map(|o| o.flux).fold(f64::NEG_INFINITY, f64::max);
     if peak <= 0.0 {
         return Err("Non-positive peak flux.".to_string());
     }
@@ -557,12 +577,17 @@ fn finalize_preprocessing(mut obs: Vec<Obs>) -> Result<PreprocessedData, String>
 
     // Sort by (band, phase)
     obs.sort_by(|a, b| {
-        a.band.idx()
+        a.band
+            .idx()
             .cmp(&b.band.idx())
             .then(a.phase.partial_cmp(&b.phase).unwrap())
     });
 
-    Ok(PreprocessedData { obs, orig_size, peak_flux: peak })
+    Ok(PreprocessedData {
+        obs,
+        orig_size,
+        peak_flux: peak,
+    })
 }
 
 pub struct PreprocessedData {
@@ -703,7 +728,10 @@ impl BandIndices {
                 _ => {}
             }
         }
-        BandIndices { r_indices, g_indices }
+        BandIndices {
+            r_indices,
+            g_indices,
+        }
     }
 }
 
@@ -786,6 +814,13 @@ pub struct PsoConfig {
     pub w: f64,
     pub c1: f64,
     pub c2: f64,
+    pub multi_seed_strategy: MultiSeedStrategy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MultiSeedStrategy {
+    EarlyStop,
+    TryAll,
 }
 
 impl Default for PsoConfig {
@@ -794,9 +829,10 @@ impl Default for PsoConfig {
             n_particles: 200,
             max_iters: 1500,
             stall_iters: 60,
-            w: 0.9,   // initial inertia (decays to 0.4 over iterations)
+            w: 0.9, // initial inertia (decays to 0.4 over iterations)
             c1: 1.5,
             c2: 1.5,
+            multi_seed_strategy: MultiSeedStrategy::EarlyStop,
         }
     }
 }
@@ -871,8 +907,7 @@ pub fn pso_minimize(
                 velocities[p][d] = w * velocities[p][d]
                     + config.c1 * r1 * (pbest_pos[p][d] - positions[p][d])
                     + config.c2 * r2 * (gbest_pos[d] - positions[p][d]);
-                positions[p][d] =
-                    (positions[p][d] + velocities[p][d]).clamp(lower[d], upper[d]);
+                positions[p][d] = (positions[p][d] + velocities[p][d]).clamp(lower[d], upper[d]);
             }
             let cost = cost_fn(&positions[p]);
             if cost < pbest_cost[p] {
@@ -884,8 +919,7 @@ pub fn pso_minimize(
                 }
             }
         }
-        let improved =
-            prev_gbest - gbest_cost > 1e-4 * prev_gbest.abs().max(1e-10);
+        let improved = prev_gbest - gbest_cost > 1e-4 * prev_gbest.abs().max(1e-10);
         if improved {
             iters_without_improvement = 0;
             prev_gbest = gbest_cost;
@@ -909,10 +943,9 @@ pub fn pso_minimize(
                         if ri < n_restart / 2 {
                             let u1: f64 = rng.random::<f64>().max(1e-10);
                             let u2: f64 = rng.random::<f64>();
-                            let z = (-2.0 * u1.ln()).sqrt()
-                                * (2.0 * std::f64::consts::PI * u2).cos();
-                            positions[p][d] =
-                                (means[d] + z * stds[d]).clamp(lower[d], upper[d]);
+                            let z =
+                                (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+                            positions[p][d] = (means[d] + z * stds[d]).clamp(lower[d], upper[d]);
                         } else {
                             positions[p][d] =
                                 lower[d] + rng.random::<f64>() * (upper[d] - lower[d]);
@@ -973,10 +1006,7 @@ impl FitResult {
         for (filt_idx, filt) in FILTERS.iter().enumerate() {
             for (p_idx, pname) in PARAM_NAMES.iter().enumerate() {
                 let idx = filt_idx * N_BASE + p_idx;
-                println!(
-                    "  {}_{:<14} = {:>12.6}",
-                    pname, filt, phys[idx]
-                );
+                println!("  {}_{:<14} = {:>12.6}", pname, filt, phys[idx]);
             }
         }
     }
@@ -984,69 +1014,31 @@ impl FitResult {
 
 /// Run the full fitting pipeline on a CSV file.
 pub fn fit_lightcurve(csv_path: &str) -> Result<FitResult, String> {
-    let data = preprocess(csv_path)?;
+    fit_lightcurve_with_config(csv_path, &PsoConfig::default())
+}
 
-    let param_map = build_param_map(&data.obs);
-    let priors = PriorArrays::new();
-
-    // PSO bounds = prior mins/maxs
-    let mut lower = [0.0; N_PARAMS];
-    let mut upper = [0.0; N_PARAMS];
-    for i in 0..N_PARAMS {
-        lower[i] = priors.mins[i];
-        upper[i] = priors.maxs[i];
-    }
-
-    let config = PsoConfig::default();
-    let band_indices = BandIndices::new(&data.obs, data.orig_size);
-
-    // Multi-seed PSO (3 seeds, skip later ones if first two agree)
-    let seeds: [u64; 3] = [42, 137, 271];
-    let mut best_params = [0.0; N_PARAMS];
-    let mut best_cost = f64::INFINITY;
-    let mut first_cost = f64::INFINITY;
-
-    let cost_fn = |raw: &[f64; N_PARAMS]| {
-        pso_cost(raw, &data.obs, &param_map, data.orig_size, &priors, 0.0, &band_indices)
-    };
-
-    for (i, &seed) in seeds.iter().enumerate() {
-        if i >= 2 && (first_cost - best_cost).abs() < 0.05 * best_cost.abs().max(1e-10) {
-            break;
-        }
-        let (params, cost) = pso_minimize(&cost_fn, &lower, &upper, &priors, &config, seed);
-        if i == 0 {
-            first_cost = cost;
-        }
-        if cost < best_cost {
-            best_cost = cost;
-            best_params = params;
-        }
-    }
-    let phys = to_physical(&best_params, &priors);
-    let rchi2 = reduced_chi2(&best_params, &data.obs, &param_map, data.orig_size, &priors);
-
-    // Keep only the real (unpadded) observations for plotting
-    // Padded obs have phase=1000.0 and flux_err=1000.0
-    let real_obs: Vec<Obs> = data.obs.into_iter()
-        .filter(|o| o.phase < 999.0 && o.flux_err < 999.0)
-        .collect();
-
-    let vp = VillarParams::from_phys(&phys);
-    Ok(FitResult {
-        params: vp,
-        params_unnorm: vp.unnormalized(data.peak_flux),
-        peak_flux: data.peak_flux,
-        reduced_chi2: rchi2,
-        orig_size: data.orig_size,
-        obs: real_obs,
-    })
+/// Run the full fitting pipeline on a CSV file using a custom PSO config.
+pub fn fit_lightcurve_with_config(csv_path: &str, config: &PsoConfig) -> Result<FitResult, String> {
+    fit_preprocessed_with_config(preprocess(csv_path)?, config)
 }
 
 /// Run the full fitting pipeline on a slice of `PhotometryMag` structs.
 pub fn fit_photometry(data: &[PhotometryMag]) -> Result<FitResult, String> {
-    let data = preprocess_from_photometry(data)?;
+    fit_photometry_with_config(data, &PsoConfig::default())
+}
 
+/// Run the full fitting pipeline on photometry using a custom PSO config.
+pub fn fit_photometry_with_config(
+    data: &[PhotometryMag],
+    config: &PsoConfig,
+) -> Result<FitResult, String> {
+    fit_preprocessed_with_config(preprocess_from_photometry(data)?, config)
+}
+
+fn fit_preprocessed_with_config(
+    data: PreprocessedData,
+    config: &PsoConfig,
+) -> Result<FitResult, String> {
     let param_map = build_param_map(&data.obs);
     let priors = PriorArrays::new();
 
@@ -1057,23 +1049,33 @@ pub fn fit_photometry(data: &[PhotometryMag]) -> Result<FitResult, String> {
         upper[i] = priors.maxs[i];
     }
 
-    let config = PsoConfig::default();
     let band_indices = BandIndices::new(&data.obs, data.orig_size);
 
-    let seeds: [u64; 3] = [42, 137, 271];
     let mut best_params = [0.0; N_PARAMS];
     let mut best_cost = f64::INFINITY;
     let mut first_cost = f64::INFINITY;
 
     let cost_fn = |raw: &[f64; N_PARAMS]| {
-        pso_cost(raw, &data.obs, &param_map, data.orig_size, &priors, 0.0, &band_indices)
+        pso_cost(
+            raw,
+            &data.obs,
+            &param_map,
+            data.orig_size,
+            &priors,
+            0.0,
+            &band_indices,
+        )
     };
 
-    for (i, &seed) in seeds.iter().enumerate() {
-        if i >= 2 && (first_cost - best_cost).abs() < 0.05 * best_cost.abs().max(1e-10) {
-            break;
+    for (i, &seed) in MULTI_SEEDS.iter().enumerate() {
+        if i >= 2 {
+            if matches!(config.multi_seed_strategy, MultiSeedStrategy::EarlyStop)
+                && (first_cost - best_cost).abs() < 0.05 * best_cost.abs().max(1e-10)
+            {
+                break;
+            }
         }
-        let (params, cost) = pso_minimize(&cost_fn, &lower, &upper, &priors, &config, seed);
+        let (params, cost) = pso_minimize(&cost_fn, &lower, &upper, &priors, config, seed);
         if i == 0 {
             first_cost = cost;
         }
@@ -1085,7 +1087,9 @@ pub fn fit_photometry(data: &[PhotometryMag]) -> Result<FitResult, String> {
     let phys = to_physical(&best_params, &priors);
     let rchi2 = reduced_chi2(&best_params, &data.obs, &param_map, data.orig_size, &priors);
 
-    let real_obs: Vec<Obs> = data.obs.into_iter()
+    let real_obs: Vec<Obs> = data
+        .obs
+        .into_iter()
         .filter(|o| o.phase < 999.0 && o.flux_err < 999.0)
         .collect();
 
@@ -1111,8 +1115,8 @@ mod python_bindings {
     /// Fit a ZTF light curve CSV and return a dict with results.
     #[pyfunction]
     fn fit(csv_path: &str) -> PyResult<PyObject> {
-        let result = fit_lightcurve(csv_path)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+        let result =
+            fit_lightcurve(csv_path).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
 
         Python::with_gil(|py| {
             let dict = PyDict::new(py);
@@ -1132,14 +1136,18 @@ mod python_bindings {
             dict.set_item("reduced_chi2", result.reduced_chi2)?;
             dict.set_item("orig_size", result.orig_size)?;
 
-            let obs_list: Vec<PyObject> = result.obs.iter().map(|o| {
-                let d = PyDict::new(py);
-                d.set_item("phase", o.phase).unwrap();
-                d.set_item("flux", o.flux).unwrap();
-                d.set_item("flux_err", o.flux_err).unwrap();
-                d.set_item("band", o.band.idx()).unwrap();
-                d.into_any().unbind()
-            }).collect();
+            let obs_list: Vec<PyObject> = result
+                .obs
+                .iter()
+                .map(|o| {
+                    let d = PyDict::new(py);
+                    d.set_item("phase", o.phase).unwrap();
+                    d.set_item("flux", o.flux).unwrap();
+                    d.set_item("flux_err", o.flux_err).unwrap();
+                    d.set_item("band", o.band.idx()).unwrap();
+                    d.into_any().unbind()
+                })
+                .collect();
             dict.set_item("obs", obs_list)?;
 
             Ok(dict.into_any().unbind())
@@ -1148,34 +1156,58 @@ mod python_bindings {
 
     /// Evaluate the Villar model on a dense time grid for one filter.
     #[pyfunction]
-    fn eval_villar(params: &Bound<'_, PyDict>, t_dense: Vec<f64>, filt: &str) -> PyResult<Vec<f64>> {
+    fn eval_villar(
+        params: &Bound<'_, PyDict>,
+        t_dense: Vec<f64>,
+        filt: &str,
+    ) -> PyResult<Vec<f64>> {
         let band = match filt {
             "ZTF_r" | "r" => Band::R,
             "ZTF_g" | "g" => Band::G,
-            _ => return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("Unknown filter: {}. Use 'ZTF_r' or 'ZTF_g'", filt)
-            )),
+            _ => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Unknown filter: {}. Use 'ZTF_r' or 'ZTF_g'",
+                    filt
+                )))
+            }
         };
 
         let offset = band.idx() * N_BASE;
-        let pm = [offset, offset + 1, offset + 2, offset + 3, offset + 4, offset + 5, offset + 6];
+        let pm = [
+            offset,
+            offset + 1,
+            offset + 2,
+            offset + 3,
+            offset + 4,
+            offset + 5,
+            offset + 6,
+        ];
 
         let mut phys = [0.0; N_PARAMS];
         for (fi, f) in FILTERS.iter().enumerate() {
             for (pi, pn) in PARAM_NAMES.iter().enumerate() {
                 let key = format!("{}_{}", pn, f);
-                let val: f64 = params.get_item(&key)?
+                let val: f64 = params
+                    .get_item(&key)?
                     .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(key.clone()))?
                     .extract()?;
                 phys[fi * N_BASE + pi] = val;
             }
         }
 
-        let result: Vec<f64> = t_dense.iter().map(|&t| {
-            let dummy = Obs { phase: t, flux: 0.0, flux_err: 0.0, band };
-            let (f, _) = villar_flux_at(&phys, &dummy, &pm, 0.0);
-            f
-        }).collect();
+        let result: Vec<f64> = t_dense
+            .iter()
+            .map(|&t| {
+                let dummy = Obs {
+                    phase: t,
+                    flux: 0.0,
+                    flux_err: 0.0,
+                    band,
+                };
+                let (f, _) = villar_flux_at(&phys, &dummy, &pm, 0.0);
+                f
+            })
+            .collect();
 
         Ok(result)
     }
@@ -1186,7 +1218,7 @@ mod python_bindings {
     #[cfg(feature = "cuda")]
     #[pyfunction]
     fn fit_gpu(csv_paths: &Bound<'_, pyo3::types::PyAny>) -> PyResult<PyObject> {
-        use crate::gpu::{GpuBatchData, GpuContext, SourceData};
+        use crate::gpu::{GpuContext, SourceData};
 
         // Accept str or list of str
         let paths: Vec<String> = if let Ok(s) = csv_paths.extract::<String>() {
@@ -1219,11 +1251,11 @@ mod python_bindings {
         }
 
         let config = PsoConfig::default();
-        let gpu = GpuContext::new(0)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+        let gpu = GpuContext::new(0).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
 
         let source_data: Vec<&SourceData> = sources.iter().map(|(_, s)| s).collect();
-        let batch_data = GpuBatchData::new(&source_data)
+        let batch_data = gpu
+            .pack_batch(&source_data)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
         let results = gpu
             .batch_pso_multi_seed(&batch_data, &source_data, &config)
@@ -1289,4 +1321,3 @@ mod python_bindings {
         Ok(())
     }
 }
-

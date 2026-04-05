@@ -2,119 +2,214 @@
 
 Joint two-band Villar light-curve fitter using Particle Swarm Optimisation (PSO).
 
-## Using as a dependency
+Backends:
 
-Add to your project's `Cargo.toml`:
+* CPU (default)
+* CUDA (`feature = "cuda"`, non-macOS targets)
+* Metal (`feature = "metal"`, macOS only)
 
-### Without GPU (CPU only)
+Backend feature policy:
+
+* `cuda` and `metal` are mutually exclusive.
+* `cuda` is rejected for macOS targets.
+* `metal` is rejected for non-macOS targets.
+
+## Installation
+
+### CPU-only
 
 ```toml
 [dependencies]
 villar-pso = { git = "https://github.com/frenbox/villar-pso.git" }
 ```
 
-No feature flags needed. This gives you the core library (`fit_lightcurve`,
-`preprocess`, etc.) and Rayon-based CPU parallelism.
-
-### With GPU (CUDA)
+### CUDA (NVIDIA)
 
 ```toml
 villar-pso = { git = "https://github.com/frenbox/villar-pso.git", features = ["cuda"] }
 ```
 
-Requires `nvcc` and CUDA toolkit on the build machine. This enables the `gpu`
-module (`GpuContext`, `GpuBatchData`, `batch_pso_multi_seed`, etc.).
+Requirements:
 
-### Python bindings (PyO3)
+* NVIDIA GPU and drivers
+* CUDA toolkit
+* `nvcc` available on PATH (build fails with a clear error if not found)
+
+### Metal (macOS)
+
+```toml
+villar-pso = { git = "https://github.com/frenbox/villar-pso.git", features = ["metal"] }
+```
+
+Requirements:
+
+* macOS
+* Apple Metal support
+
+## Core API
+
+### CPU fitting
+
+* `fit_lightcurve(path)`
+* `fit_photometry(points)`
+
+Config-aware variants:
+
+* `fit_lightcurve_with_config(path, &PsoConfig)`
+* `fit_photometry_with_config(points, &PsoConfig)`
+
+### GPU fitting
+
+GPU API is under `villar_pso::gpu`:
+
+* `GpuContext::new(device)` chooses default backend for the enabled build.
+* `GpuContext::new_with_backend(device, GpuBackend::Cuda|Metal)` chooses explicitly.
+* `pack_batch(...)` uploads batched sources.
+* `batch_pso_multi_seed(...)` runs multi-seed fitting.
+
+Backend selection notes:
+
+* Exactly one GPU backend feature may be enabled.
+* `GpuContext::new(...)` selects the enabled backend for the build.
+
+## Multi-Seed Strategy
+
+`PsoConfig` includes `multi_seed_strategy`:
+
+* `MultiSeedStrategy::EarlyStop` (default)
+: Runs seeds in order and stops once improvement stabilizes.
+* `MultiSeedStrategy::TryAll`
+: Runs all seeds in `MULTI_SEEDS` and keeps the best result.
+
+Applies consistently across CPU, CUDA, and Metal.
+
+Example:
+
+```rust
+use villar_pso::{fit_lightcurve_with_config, MultiSeedStrategy, PsoConfig};
+
+let config = PsoConfig {
+    multi_seed_strategy: MultiSeedStrategy::TryAll,
+    ..PsoConfig::default()
+};
+
+let fit = fit_lightcurve_with_config("/path/to/source.csv", &config)?;
+println!("reduced chi2 = {}", fit.reduced_chi2);
+# Ok::<(), String>(())
+```
+
+## Numerical Precision by Backend
+
+Precision differs by backend:
+
+* CPU: `f64`
+* CUDA: `double`/`f64`
+* Metal: `float`/`f32`
+
+Metal uses `float` because general fp64 (`double`) support is not available in Metal shader targets.
+The host side converts between `f64` and `f32` at the Metal boundary.
+
+Practical implication: backend outputs are expected to be close, but not bit-identical.
+
+## Python Bindings (PyO3)
+
+Enable with:
 
 ```toml
 villar-pso = { git = "https://github.com/frenbox/villar-pso.git", features = ["python"] }
 ```
 
-Build with [maturin](https://www.maturin.rs/):
+Build via [maturin](https://www.maturin.rs/):
 
 ```bash
-maturin develop --release --features python         # CPU only
-maturin develop --release --features "python,cuda"   # CPU + GPU
+maturin develop --release --features python
+maturin develop --release --features "python,cuda"
+maturin develop --release --features "python,metal"
 ```
+
+## Tests
+
+Common test commands:
+
+```bash
+cargo test
+cargo test --features metal
+cargo test --features cuda
+```
+
+Notes:
+
+* CUDA tests are feature-gated and require CUDA toolchain/runtime.
+* Metal tests are feature-gated; runtime path is macOS-specific.
+* The suite includes parity checks (CPU vs GPU), strategy checks (EarlyStop vs TryAll), smoke tests, and kernel-layout checks.
 
 ## Benchmarks
 
-Two benchmark binaries are included:
+Three benchmark binaries are included:
 
-| Binary | What it tests |
-|--------|--------------|
-| `cpu-dispatch-bench` | Compares sequential dispatch (`par_iter`, 1 file at a time) vs batch dispatch (`par_chunks(500)`) across 2, 4, 6, 8, 10 Rayon threads |
-| `gpu-scaling-bench` | Scales from 1 to N GPUs, one Rayon thread per GPU, processing all sources in chunks of 500 |
+| Binary | Purpose |
+| ------ | ------- |
+| `cpu-dispatch-bench` | Compares sequential vs chunked CPU dispatch over Rayon thread counts |
+| `gpu-scaling-bench` | Measures CUDA scaling from 1..N GPUs |
+| `metal-scaling-bench` | Runs Metal backend scaling scaffold on macOS |
 
-### Running benchmarks locally
-
-**CPU benchmark (no GPU needed):**
+Run locally:
 
 ```bash
 cargo build --release --bin cpu-dispatch-bench
 ./target/release/cpu-dispatch-bench /path/to/photometry/
-```
 
-**GPU benchmark (requires CUDA):**
-
-```bash
 CUDA_HOME=/usr/local/cuda cargo build --release --features cuda --bin gpu-scaling-bench
 ./target/release/gpu-scaling-bench /path/to/photometry/
+
+cargo build --release --features metal --bin metal-scaling-bench
+./target/release/metal-scaling-bench /path/to/photometry/
 ```
 
-### Running benchmarks via Apptainer
-
-For machines where CUDA is available only through containers.
-
-**1. Build the container** (from the `villar-pso/` directory):
+### Apptainer (CUDA)
 
 ```bash
 apptainer build --fakeroot rustgp.sif rustgp.def
+
+apptainer exec --nv \
+  --bind /path/to/project:/path/to/project \
+  rustgp.sif \
+  /app/gpu-scaling-bench /path/to/photometry/
 ```
 
-**2. Run CPU benchmark:**
-
-```bash
-apptainer exec \
-    --bind /path/to/project:/path/to/project \
-    rustgp.sif \
-    /app/cpu-dispatch-bench /path/to/photometry/
-```
-
-**3. Run GPU benchmark:**
+Optional GPU limit:
 
 ```bash
 apptainer exec --nv \
-    --bind /path/to/project:/path/to/project \
-    rustgp.sif \
-    /app/gpu-scaling-bench /path/to/photometry/
+  --bind /path/to/project:/path/to/project \
+  rustgp.sif \
+  /app/gpu-scaling-bench /path/to/photometry/ --gpus 4
 ```
 
-The `--nv` flag exposes host NVIDIA drivers to the container.
+## Project Structure
 
-**4. Limit GPU count** (optional):
-
-```bash
-apptainer exec --nv \
-    --bind /path/to/project:/path/to/project \
-    rustgp.sif \
-    /app/gpu-scaling-bench /path/to/photometry/ --gpus 4
-```
-
-## Project structure
-
-```
+```text
 villar-pso/
 ├── Cargo.toml
-├── build.rs              # CUDA kernel compilation (when cuda feature enabled)
-├── rustgp.def            # Apptainer container definition
+├── build.rs
+├── rustgp.def
 ├── cuda/
-│   └── villar_joint.cu   # GPU cost function kernel
+│   └── villar_joint.cu
+├── metal/
+│   └── villar_joint.metal
+├── tests/
+│   ├── synthetic_lightcurves.rs
+│   ├── metal_kernel_layout.rs
+│   └── cuda_kernel_layout.rs
 └── src/
-    ├── lib.rs            # Core library: preprocessing, PSO, fitting, PyO3 bindings
-    ├── gpu.rs            # GPU batch PSO, multi-GPU support
+    ├── lib.rs
+    ├── gpu/
+    │   ├── mod.rs
+    │   ├── cuda.rs
+    │   ├── metal.rs
+    │   └── host_shared.rs
     └── bin/
         ├── cpu_dispatch_bench.rs
-        └── gpu_scaling_bench.rs
+        ├── gpu_scaling_bench.rs
+        └── metal_scaling_bench.rs
 ```
