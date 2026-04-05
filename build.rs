@@ -233,15 +233,21 @@ fn main() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_else(|_| "unknown".to_string());
 
     if cfg!(all(feature = "cuda", feature = "metal")) {
-        fail_build("Features 'cuda' and 'metal' are mutually exclusive. Enable exactly one GPU backend.");
+        fail_build(
+            "Features 'cuda' and 'metal' are mutually exclusive. Enable exactly one GPU backend.",
+        );
     }
 
     if cfg!(feature = "cuda") && target_os == "macos" {
-        fail_build("Feature 'cuda' is not supported on macOS in this crate. Use feature 'metal' on macOS.");
+        fail_build(
+            "Feature 'cuda' is not supported on macOS in this crate. Use feature 'metal' on macOS.",
+        );
     }
 
     if cfg!(feature = "metal") && target_os != "macos" {
-        fail_build("Feature 'metal' requires a macOS target. Disable 'metal' for non-macOS builds.");
+        fail_build(
+            "Feature 'metal' requires a macOS target. Disable 'metal' for non-macOS builds.",
+        );
     }
 
     #[cfg(feature = "cuda")]
