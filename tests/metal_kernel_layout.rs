@@ -8,11 +8,11 @@ fn metal_shader_contains_expected_entrypoints() {
         "missing Metal kernel entrypoint"
     );
     assert!(
-        src.contains("inline double villar_flux"),
+        src.contains("inline float villar_flux"),
         "missing villar_flux helper"
     );
     assert!(
-        src.contains("inline double villar_constraint"),
+        src.contains("inline float villar_constraint"),
         "missing villar_constraint helper"
     );
     assert!(

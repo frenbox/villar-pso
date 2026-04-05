@@ -1,7 +1,7 @@
 use crate::{FitResult, PsoConfig};
 
 #[cfg(target_os = "macos")]
-use crate::{PriorArrays, MULTI_SEEDS, N_PARAMS};
+use crate::{MultiSeedStrategy, PriorArrays, MULTI_SEEDS, N_PARAMS};
 
 #[cfg(target_os = "macos")]
 use super::host_shared::{
@@ -31,13 +31,11 @@ mod imp {
     }
 
     fn upload_slice<T>(device: &Device, data: &[T]) -> Buffer {
-        unsafe {
-            device.new_buffer_with_data(
-                data.as_ptr() as *const c_void,
-                as_u64_bytes::<T>(data.len()),
-                MTLResourceOptions::StorageModeShared,
-            )
-        }
+        device.new_buffer_with_data(
+            data.as_ptr() as *const c_void,
+            as_u64_bytes::<T>(data.len()),
+            MTLResourceOptions::StorageModeShared,
+        )
     }
 
     fn alloc_buffer<T>(device: &Device, len: usize) -> Buffer {
@@ -76,6 +74,7 @@ mod imp {
 
             let source = include_str!("../../metal/villar_joint.metal");
             let options = CompileOptions::new();
+            options.set_fast_math_enabled(false);
             let lib = dev
                 .new_library_with_source(source, &options)
                 .map_err(|e| format!("Metal shader compile failed: {}", e))?;
@@ -109,11 +108,15 @@ mod imp {
         ) -> Result<MetalBatchData, String> {
             let n_sources = sources.len();
             let packed = pack_host_batch(sources);
+            let all_times: Vec<f32> = packed.all_times.iter().map(|&v| v as f32).collect();
+            let all_flux: Vec<f32> = packed.all_flux.iter().map(|&v| v as f32).collect();
+            let all_flux_err_sq: Vec<f32> =
+                packed.all_flux_err_sq.iter().map(|&v| v as f32).collect();
 
             Ok(MetalBatchData {
-                all_times: upload_slice(&self.device, &packed.all_times),
-                all_flux: upload_slice(&self.device, &packed.all_flux),
-                all_flux_err_sq: upload_slice(&self.device, &packed.all_flux_err_sq),
+                all_times: upload_slice(&self.device, &all_times),
+                all_flux: upload_slice(&self.device, &all_flux),
+                all_flux_err_sq: upload_slice(&self.device, &all_flux_err_sq),
                 all_band: upload_slice(&self.device, &packed.all_band),
                 source_offsets: upload_slice(&self.device, &packed.source_offsets),
                 n_r_per_source: upload_slice(&self.device, &packed.n_r_per_source),
@@ -135,11 +138,12 @@ mod imp {
             h_costs: &mut [f64],
             total_particles: usize,
         ) -> Result<(), String> {
+            let h_positions_f32: Vec<f32> = h_positions.iter().map(|&v| v as f32).collect();
             unsafe {
                 ptr::copy_nonoverlapping(
-                    h_positions.as_ptr(),
-                    positions_buf.contents() as *mut f64,
-                    h_positions.len(),
+                    h_positions_f32.as_ptr(),
+                    positions_buf.contents() as *mut f32,
+                    h_positions_f32.len(),
                 );
             }
 
@@ -172,12 +176,17 @@ mod imp {
             command_buffer.commit();
             command_buffer.wait_until_completed();
 
+            let mut h_costs_f32 = vec![0.0f32; h_costs.len()];
             unsafe {
                 ptr::copy_nonoverlapping(
-                    costs_buf.contents() as *const f64,
-                    h_costs.as_mut_ptr(),
-                    h_costs.len(),
+                    costs_buf.contents() as *const f32,
+                    h_costs_f32.as_mut_ptr(),
+                    h_costs_f32.len(),
                 );
+            }
+
+            for (dst, src) in h_costs.iter_mut().zip(h_costs_f32.iter()) {
+                *dst = *src as f64;
             }
 
             Ok(())
@@ -200,10 +209,12 @@ mod imp {
             let upper: [f64; N_PARAMS] = priors.maxs;
             let v_max: Vec<f64> = (0..dim).map(|d| 0.5 * (upper[d] - lower[d])).collect();
 
-            let positions_buf = alloc_buffer::<f64>(&self.device, total_particles * dim);
-            let costs_buf = alloc_buffer::<f64>(&self.device, total_particles);
-            let prior_means_buf = upload_slice(&self.device, &priors.means);
-            let prior_stds_buf = upload_slice(&self.device, &priors.stds);
+            let positions_buf = alloc_buffer::<f32>(&self.device, total_particles * dim);
+            let costs_buf = alloc_buffer::<f32>(&self.device, total_particles);
+            let prior_means: Vec<f32> = priors.means.iter().map(|&v| v as f32).collect();
+            let prior_stds: Vec<f32> = priors.stds.iter().map(|&v| v as f32).collect();
+            let prior_means_buf = upload_slice(&self.device, &prior_means);
+            let prior_stds_buf = upload_slice(&self.device, &prior_stds);
             let logged_mask: Vec<i32> = priors
                 .logged
                 .iter()
@@ -259,9 +270,27 @@ mod imp {
             config: &PsoConfig,
         ) -> Result<Vec<FitResult>, String> {
             let mut best: Option<Vec<FitResult>> = None;
+            let mut first_seed_rchi2: Option<Vec<f64>> = None;
 
-            for &seed in &MULTI_SEEDS {
+            for (i, &seed) in MULTI_SEEDS.iter().enumerate() {
+                if i >= 2 {
+                    if matches!(config.multi_seed_strategy, MultiSeedStrategy::EarlyStop) {
+                        if let (Some(first), Some(cur_best)) = (&first_seed_rchi2, &best) {
+                            let stabilized_all = first.iter().zip(cur_best.iter()).all(|(f, b)| {
+                                let best_rchi2 = b.reduced_chi2;
+                                (f - best_rchi2).abs() < 0.05 * best_rchi2.abs().max(1e-10)
+                            });
+                            if stabilized_all {
+                                break;
+                            }
+                        }
+                    }
+                }
+
                 let results = self.batch_pso(data, sources, config, seed)?;
+                if i == 0 {
+                    first_seed_rchi2 = Some(results.iter().map(|r| r.reduced_chi2).collect());
+                }
                 best = merge_best_results(best, results);
             }
             Ok(best.unwrap())

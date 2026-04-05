@@ -4,7 +4,7 @@ use std::ffi::c_int;
 use std::mem::size_of;
 use std::ptr;
 
-use crate::{FitResult, PriorArrays, PsoConfig, MULTI_SEEDS, N_PARAMS};
+use crate::{FitResult, MultiSeedStrategy, PriorArrays, PsoConfig, MULTI_SEEDS, N_PARAMS};
 
 use super::host_shared::{
     collect_fit_results, merge_best_results, pack_host_batch, run_host_pso_loop, HostPsoContext,
@@ -296,9 +296,27 @@ impl CudaContext {
         config: &PsoConfig,
     ) -> Result<Vec<FitResult>, String> {
         let mut best: Option<Vec<FitResult>> = None;
+        let mut first_seed_rchi2: Option<Vec<f64>> = None;
 
-        for &seed in &MULTI_SEEDS {
+        for (i, &seed) in MULTI_SEEDS.iter().enumerate() {
+            if i >= 2 {
+                if matches!(config.multi_seed_strategy, MultiSeedStrategy::EarlyStop) {
+                    if let (Some(first), Some(cur_best)) = (&first_seed_rchi2, &best) {
+                        let stabilized_all = first.iter().zip(cur_best.iter()).all(|(f, b)| {
+                            let best_rchi2 = b.reduced_chi2;
+                            (f - best_rchi2).abs() < 0.05 * best_rchi2.abs().max(1e-10)
+                        });
+                        if stabilized_all {
+                            break;
+                        }
+                    }
+                }
+            }
+
             let results = self.batch_pso(data, sources, config, seed)?;
+            if i == 0 {
+                first_seed_rchi2 = Some(results.iter().map(|r| r.reduced_chi2).collect());
+            }
             best = merge_best_results(best, results);
         }
         Ok(best.unwrap())

@@ -803,6 +803,13 @@ pub struct PsoConfig {
     pub w: f64,
     pub c1: f64,
     pub c2: f64,
+    pub multi_seed_strategy: MultiSeedStrategy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MultiSeedStrategy {
+    EarlyStop,
+    TryAll,
 }
 
 impl Default for PsoConfig {
@@ -814,6 +821,7 @@ impl Default for PsoConfig {
             w: 0.9, // initial inertia (decays to 0.4 over iterations)
             c1: 1.5,
             c2: 1.5,
+            multi_seed_strategy: MultiSeedStrategy::EarlyStop,
         }
     }
 }
@@ -995,15 +1003,31 @@ impl FitResult {
 
 /// Run the full fitting pipeline on a CSV file.
 pub fn fit_lightcurve(csv_path: &str) -> Result<FitResult, String> {
-    fit_preprocessed(preprocess(csv_path)?)
+    fit_lightcurve_with_config(csv_path, &PsoConfig::default())
+}
+
+/// Run the full fitting pipeline on a CSV file using a custom PSO config.
+pub fn fit_lightcurve_with_config(csv_path: &str, config: &PsoConfig) -> Result<FitResult, String> {
+    fit_preprocessed_with_config(preprocess(csv_path)?, config)
 }
 
 /// Run the full fitting pipeline on a slice of `PhotometryMag` structs.
 pub fn fit_photometry(data: &[PhotometryMag]) -> Result<FitResult, String> {
-    fit_preprocessed(preprocess_from_photometry(data)?)
+    fit_photometry_with_config(data, &PsoConfig::default())
 }
 
-fn fit_preprocessed(data: PreprocessedData) -> Result<FitResult, String> {
+/// Run the full fitting pipeline on photometry using a custom PSO config.
+pub fn fit_photometry_with_config(
+    data: &[PhotometryMag],
+    config: &PsoConfig,
+) -> Result<FitResult, String> {
+    fit_preprocessed_with_config(preprocess_from_photometry(data)?, config)
+}
+
+fn fit_preprocessed_with_config(
+    data: PreprocessedData,
+    config: &PsoConfig,
+) -> Result<FitResult, String> {
     let param_map = build_param_map(&data.obs);
     let priors = PriorArrays::new();
 
@@ -1014,7 +1038,6 @@ fn fit_preprocessed(data: PreprocessedData) -> Result<FitResult, String> {
         upper[i] = priors.maxs[i];
     }
 
-    let config = PsoConfig::default();
     let band_indices = BandIndices::new(&data.obs, data.orig_size);
 
     let mut best_params = [0.0; N_PARAMS];
@@ -1034,10 +1057,14 @@ fn fit_preprocessed(data: PreprocessedData) -> Result<FitResult, String> {
     };
 
     for (i, &seed) in MULTI_SEEDS.iter().enumerate() {
-        if i >= 2 && (first_cost - best_cost).abs() < 0.05 * best_cost.abs().max(1e-10) {
-            break;
+        if i >= 2 {
+            if matches!(config.multi_seed_strategy, MultiSeedStrategy::EarlyStop)
+                && (first_cost - best_cost).abs() < 0.05 * best_cost.abs().max(1e-10)
+            {
+                break;
+            }
         }
-        let (params, cost) = pso_minimize(&cost_fn, &lower, &upper, &priors, &config, seed);
+        let (params, cost) = pso_minimize(&cost_fn, &lower, &upper, &priors, config, seed);
         if i == 0 {
             first_cost = cost;
         }
