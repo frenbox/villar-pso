@@ -74,7 +74,7 @@ mod imp {
 
             let source = include_str!("../../metal/villar_joint.metal");
             let options = CompileOptions::new();
-            options.set_fast_math_enabled(false);
+            options.set_fast_math_enabled(true);
             let lib = dev
                 .new_library_with_source(source, &options)
                 .map_err(|e| format!("Metal shader compile failed: {}", e))?;
