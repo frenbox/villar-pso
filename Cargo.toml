@@ -32,6 +32,11 @@ name = "gpu-scaling-bench"
 path = "src/bin/gpu_scaling_bench.rs"
 required-features = ["cuda"]
 
+[[bin]]
+name = "gpu-batch1000-bench"
+path = "src/bin/gpu_batch1000_bench.rs"
+required-features = ["cuda"]
+
 [profile.release]
 lto = "fat"
 codegen-units = 1
