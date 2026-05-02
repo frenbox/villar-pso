@@ -45,6 +45,11 @@ name = "gpu-batch1000-bench"
 path = "src/bin/gpu_batch1000_bench.rs"
 required-features = ["cuda"]
 
+[[bin]]
+name = "metal-batch1000-bench"
+path = "src/bin/metal_batch1000_bench.rs"
+required-features = ["metal"]
+
 [profile.release]
 lto = "fat"
 codegen-units = 1
