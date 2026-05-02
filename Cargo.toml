@@ -12,6 +12,9 @@ crate-type = ["cdylib", "rlib"]
 default = []
 python = ["pyo3"]
 cuda = ["cc"]
+# Apple Silicon GPU backend (M1–M5). Pulls in the `metal` crate, which is
+# macOS-only — building this feature on Linux/Windows will fail by design.
+metal = ["dep:metal"]
 
 [dependencies]
 csv = "1.3"
@@ -19,6 +22,11 @@ pyo3 = { version = "0.24", features = ["extension-module"], optional = true }
 rand = "0.9"
 rayon = "1.10"
 serde = { version = "1.0", features = ["derive"] }
+
+# Gate the `metal` crate behind cfg(target_os = "macos") so non-macOS builds
+# don't even try to resolve it.
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = { version = "0.29", optional = true }
 
 [build-dependencies]
 cc = { version = "1", features = ["parallel"], optional = true }

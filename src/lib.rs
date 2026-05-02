@@ -11,6 +11,9 @@ use std::collections::HashMap;
 #[cfg(feature = "cuda")]
 pub mod gpu;
 
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub mod gpu_metal;
+
 // ─── Prior tables (from fit_jax_best.py) ─────────────────────────────────────
 // Each entry: (min, max, mean, std, logged)
 // logged = true → parameter lives in log10 space; 10^x applied after sampling.
@@ -1183,10 +1186,23 @@ mod python_bindings {
     /// Fit one or more ZTF light curve CSVs using the GPU batch PSO.
     /// Accepts a single path (str) or a list of paths.
     /// Returns a list of result dicts (same format as `fit()`).
-    #[cfg(feature = "cuda")]
+    ///
+    /// Backend is chosen at compile time:
+    ///   * `--features cuda`   → NVIDIA GPUs via CUDA
+    ///   * `--features metal`  → Apple Silicon GPUs (M1–M5) via Metal
+    /// CUDA wins if both features are somehow enabled.
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     #[pyfunction]
     fn fit_gpu(csv_paths: &Bound<'_, pyo3::types::PyAny>) -> PyResult<PyObject> {
-        use crate::gpu::{GpuBatchData, GpuContext, SourceData};
+        // Pick the backend module. Both expose identical types and methods,
+        // except `GpuBatchData::new` differs by one argument (Metal needs the
+        // context for buffer allocation; CUDA uses the implicit current device).
+        #[cfg(feature = "cuda")]
+        use crate::gpu as backend;
+        #[cfg(all(feature = "metal", target_os = "macos", not(feature = "cuda")))]
+        use crate::gpu_metal as backend;
+
+        use backend::{GpuBatchData, GpuContext, SourceData};
 
         // Accept str or list of str
         let paths: Vec<String> = if let Ok(s) = csv_paths.extract::<String>() {
@@ -1223,7 +1239,11 @@ mod python_bindings {
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
 
         let source_data: Vec<&SourceData> = sources.iter().map(|(_, s)| s).collect();
+        #[cfg(feature = "cuda")]
         let batch_data = GpuBatchData::new(&source_data)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+        #[cfg(all(feature = "metal", target_os = "macos", not(feature = "cuda")))]
+        let batch_data = GpuBatchData::new(&gpu, &source_data)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
         let results = gpu
             .batch_pso_multi_seed(&batch_data, &source_data, &config)
@@ -1284,7 +1304,7 @@ mod python_bindings {
     fn villar_pso(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(fit, m)?)?;
         m.add_function(wrap_pyfunction!(eval_villar, m)?)?;
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
         m.add_function(wrap_pyfunction!(fit_gpu, m)?)?;
         Ok(())
     }

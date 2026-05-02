@@ -17,4 +17,13 @@ fn build_cuda() {
 fn main() {
     #[cfg(feature = "cuda")]
     build_cuda();
+
+    // Metal: nothing to compile at build time — the .metal source is embedded
+    // in the binary via `include_str!` and compiled at runtime by
+    // `MTLDevice::newLibraryWithSource`. Just re-trigger a rebuild when the
+    // shader source changes so `include_str!` picks it up.
+    #[cfg(feature = "metal")]
+    {
+        println!("cargo:rerun-if-changed=metal/villar_joint.metal");
+    }
 }
