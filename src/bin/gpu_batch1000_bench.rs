@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use villar_pso::gpu::{load_sources, GpuBatchData, GpuContext};
+use villar_pso::gpu::{load_sources, GpuBatchData, GpuContext, Stream};
 use villar_pso::PsoConfig;
 
 extern "C" {
@@ -87,7 +87,8 @@ fn main() {
         total_obs as f64 / sources.len() as f64
     );
 
-    let gpu = GpuContext::new(0).expect("Failed to init GPU 0");
+    let stream = Stream::new_on_device(0).expect("create CUDA stream");
+    let gpu = GpuContext::new(0, stream.as_ptr()).expect("Failed to init GPU 0");
 
     let (free_baseline, total_mem) = mem_info();
     eprintln!("\nGPU 0 total memory: {:.1} MB", mb(total_mem));
@@ -98,7 +99,7 @@ fn main() {
     );
 
     let t_up = Instant::now();
-    let batch = GpuBatchData::new(&sources).expect("GPU upload failed");
+    let batch = GpuBatchData::new(&gpu, &sources).expect("GPU upload failed");
     let upload_ms = t_up.elapsed().as_secs_f64() * 1000.0;
     let (free_after_upload, _) = mem_info();
     let upload_bytes = free_baseline.saturating_sub(free_after_upload);

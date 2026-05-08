@@ -380,9 +380,9 @@ extern "C" void launch_pbest_update(
     const double* positions, double* pbest_pos, double* pbest_cost,
     const double* costs,
     int n_sources, int n_particles, int dim,
-    int grid, int block)
+    int grid, int block, cudaStream_t stream)
 {
-    pbest_update_kernel<<<grid, block>>>(
+    pbest_update_kernel<<<grid, block, 0, stream>>>(
         positions, pbest_pos, pbest_cost, costs,
         n_sources, n_particles, dim);
 }
@@ -394,9 +394,9 @@ extern "C" void launch_pso_move(
     unsigned long long* rng_states,
     double w, double c1, double c2,
     int n_sources, int n_particles, int dim,
-    int grid, int block)
+    int grid, int block, cudaStream_t stream)
 {
-    pso_move_kernel<<<grid, block>>>(
+    pso_move_kernel<<<grid, block, 0, stream>>>(
         positions, velocities, pbest_pos, gbest_pos,
         lower, upper, v_max, rng_states,
         w, c1, c2, n_sources, n_particles, dim);
@@ -411,9 +411,9 @@ extern "C" void launch_pso_restart(
     unsigned long long* rng_states,
     int n_sources, int n_particles, int dim,
     double restart_ratio,
-    int grid, int block)
+    int grid, int block, cudaStream_t stream)
 {
-    pso_restart_kernel<<<grid, block>>>(
+    pso_restart_kernel<<<grid, block, 0, stream>>>(
         positions, velocities, pbest_pos, pbest_cost, gbest_cost,
         lower, upper, v_max, prior_means, prior_stds, rng_states,
         n_sources, n_particles, dim, restart_ratio);
@@ -424,9 +424,9 @@ extern "C" void launch_gbest_reduce(
     double* gbest_cost, double* gbest_pos,
     int* stall_count, int* source_done,
     int n_sources, int n_particles, int dim, int stall_limit,
-    int grid, int block)
+    int grid, int block, cudaStream_t stream)
 {
-    gbest_reduce_kernel<<<grid, block>>>(
+    gbest_reduce_kernel<<<grid, block, 0, stream>>>(
         pbest_cost, pbest_pos, gbest_cost, gbest_pos,
         stall_count, source_done,
         n_sources, n_particles, dim, stall_limit);
@@ -448,9 +448,10 @@ extern "C" void launch_batch_pso_cost_villar_joint(
     int n_sources,
     int n_particles,
     int grid,
-    int block)
+    int block,
+    cudaStream_t stream)
 {
-    batch_pso_cost_villar_joint<<<grid, block>>>(
+    batch_pso_cost_villar_joint<<<grid, block, 0, stream>>>(
         all_times, all_flux, all_flux_err_sq, all_band,
         source_offsets, n_r_per_source, n_g_per_source,
         positions, costs,

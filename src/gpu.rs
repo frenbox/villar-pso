@@ -3,7 +3,7 @@
 //! The cost function (model eval + band-balanced likelihood + priors) runs on
 //! the GPU. The swarm update loop runs on the CPU.
 
-use std::ffi::c_int;
+use std::ffi::{c_int, c_void};
 use std::mem::size_of;
 use std::ptr;
 
@@ -21,13 +21,25 @@ use crate::{
 // ---------------------------------------------------------------------------
 
 type CudaResult = c_int;
+/// Opaque CUDA stream handle. CUDA defines `cudaStream_t` as a pointer to an
+/// incomplete struct, which is `*mut c_void` from the Rust side. A null
+/// pointer means the legacy default stream.
+pub type CudaStream = *mut c_void;
 
 extern "C" {
     fn cudaSetDevice(device: c_int) -> CudaResult;
     fn cudaMalloc(devPtr: *mut *mut u8, size: usize) -> CudaResult;
     fn cudaFree(devPtr: *mut u8) -> CudaResult;
-    fn cudaMemcpy(dst: *mut u8, src: *const u8, count: usize, kind: c_int) -> CudaResult;
-    fn cudaDeviceSynchronize() -> CudaResult;
+    fn cudaMemcpyAsync(
+        dst: *mut u8,
+        src: *const u8,
+        count: usize,
+        kind: c_int,
+        stream: CudaStream,
+    ) -> CudaResult;
+    fn cudaStreamCreate(stream: *mut CudaStream) -> CudaResult;
+    fn cudaStreamDestroy(stream: CudaStream) -> CudaResult;
+    fn cudaStreamSynchronize(stream: CudaStream) -> CudaResult;
     fn cudaGetLastError() -> CudaResult;
     fn cudaGetErrorString(error: CudaResult) -> *const i8;
 }
@@ -53,6 +65,7 @@ extern "C" {
         n_particles: c_int,
         grid: c_int,
         block: c_int,
+        stream: CudaStream,
     );
 
 }
@@ -96,26 +109,48 @@ impl DevBuf {
         Ok(Self { ptr, size })
     }
 
-    fn upload<T>(data: &[T]) -> Result<Self, String> {
+    fn upload<T>(data: &[T], stream: CudaStream) -> Result<Self, String> {
         let bytes = data.len() * size_of::<T>();
         let buf = Self::alloc(bytes)?;
         cuda_check(unsafe {
-            cudaMemcpy(buf.ptr, data.as_ptr() as *const u8, bytes, CUDA_MEMCPY_HOST_TO_DEVICE)
+            cudaMemcpyAsync(
+                buf.ptr,
+                data.as_ptr() as *const u8,
+                bytes,
+                CUDA_MEMCPY_HOST_TO_DEVICE,
+                stream,
+            )
         })?;
         Ok(buf)
     }
 
-    fn download_into<T>(&self, host: &mut [T]) -> Result<(), String> {
+    fn download_into<T>(&self, host: &mut [T], stream: CudaStream) -> Result<(), String> {
         let bytes = host.len() * size_of::<T>();
         cuda_check(unsafe {
-            cudaMemcpy(host.as_mut_ptr() as *mut u8, self.ptr, bytes, CUDA_MEMCPY_DEVICE_TO_HOST)
-        })
+            cudaMemcpyAsync(
+                host.as_mut_ptr() as *mut u8,
+                self.ptr,
+                bytes,
+                CUDA_MEMCPY_DEVICE_TO_HOST,
+                stream,
+            )
+        })?;
+        // Caller-side host buffer must be valid by the time the user reads it.
+        // Our callers always pair download_into with cudaStreamSynchronize on
+        // the same stream before touching `host`, so we don't sync here.
+        Ok(())
     }
 
-    fn upload_from<T>(&self, data: &[T]) -> Result<(), String> {
+    fn upload_from<T>(&self, data: &[T], stream: CudaStream) -> Result<(), String> {
         let bytes = data.len() * size_of::<T>();
         cuda_check(unsafe {
-            cudaMemcpy(self.ptr, data.as_ptr() as *const u8, bytes, CUDA_MEMCPY_HOST_TO_DEVICE)
+            cudaMemcpyAsync(
+                self.ptr,
+                data.as_ptr() as *const u8,
+                bytes,
+                CUDA_MEMCPY_HOST_TO_DEVICE,
+                stream,
+            )
         })
     }
 }
@@ -123,6 +158,55 @@ impl DevBuf {
 impl Drop for DevBuf {
     fn drop(&mut self) {
         unsafe { cudaFree(self.ptr); }
+    }
+}
+
+/// RAII wrapper around a CUDA stream. Calls `cudaStreamCreate` on construction
+/// and `cudaStreamDestroy` on drop. Callers can pass `stream.as_ptr()` into
+/// [`GpuContext::new`] (or share the raw pointer with another library that
+/// expects `cudaStream_t`, e.g. ONNX Runtime's `with_compute_stream`).
+///
+/// The owner must ensure the [`Stream`] outlives every `GpuContext` and any
+/// foreign session that has been told to use it. Field-declaration order in
+/// the owning struct controls drop order.
+pub struct Stream {
+    raw: CudaStream,
+}
+
+// Safety: CUDA stream handles are usable from any host thread; concurrent
+// submissions to a stream are serialized internally by the CUDA driver.
+unsafe impl Send for Stream {}
+unsafe impl Sync for Stream {}
+
+impl Stream {
+    /// Create a new CUDA stream on the currently-bound device. Call
+    /// `GpuContext::set_device` (or `cudaSetDevice` directly) first if you
+    /// need the stream on a specific device.
+    pub fn new() -> Result<Self, String> {
+        let mut raw: CudaStream = ptr::null_mut();
+        cuda_check(unsafe { cudaStreamCreate(&mut raw) })?;
+        Ok(Self { raw })
+    }
+
+    /// Create a stream on the given device. Binds the current thread to
+    /// `device` via `cudaSetDevice`, then creates the stream.
+    pub fn new_on_device(device: i32) -> Result<Self, String> {
+        cuda_check(unsafe { cudaSetDevice(device) })?;
+        Self::new()
+    }
+
+    /// Raw `cudaStream_t` pointer. Pass this to FFI consumers (e.g. ONNX
+    /// Runtime's `CUDAExecutionProvider::with_compute_stream`).
+    pub fn as_ptr(&self) -> CudaStream {
+        self.raw
+    }
+}
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            unsafe { cudaStreamDestroy(self.raw); }
+        }
     }
 }
 
@@ -155,8 +239,12 @@ pub struct GpuBatchData {
 }
 
 impl GpuBatchData {
-    /// Pack and upload preprocessed sources to the GPU.
-    pub fn new<S: AsRef<SourceData>>(sources: &[S]) -> Result<Self, String> {
+    /// Pack and upload preprocessed sources to the GPU. Uploads run async on
+    /// `ctx`'s stream, so they're ordered before any kernel later submitted to
+    /// the same stream by [`GpuContext::batch_pso`].
+    pub fn new<S: AsRef<SourceData>>(ctx: &GpuContext, sources: &[S]) -> Result<Self, String> {
+        ctx.set_device()?;
+
         let n_sources = sources.len();
         let mut all_times = Vec::new();
         let mut all_flux = Vec::new();
@@ -183,17 +271,23 @@ impl GpuBatchData {
             h_orig_sizes.push(d.orig_size);
         }
 
-        Ok(Self {
-            d_times: DevBuf::upload(&all_times)?,
-            d_flux: DevBuf::upload(&all_flux)?,
-            d_flux_err_sq: DevBuf::upload(&all_flux_err_sq)?,
-            d_band: DevBuf::upload(&all_band)?,
-            d_offsets: DevBuf::upload(&offsets)?,
-            d_n_r: DevBuf::upload(&n_r_vec)?,
-            d_n_g: DevBuf::upload(&n_g_vec)?,
+        let stream = ctx.stream();
+        let batch = Self {
+            d_times: DevBuf::upload(&all_times, stream)?,
+            d_flux: DevBuf::upload(&all_flux, stream)?,
+            d_flux_err_sq: DevBuf::upload(&all_flux_err_sq, stream)?,
+            d_band: DevBuf::upload(&all_band, stream)?,
+            d_offsets: DevBuf::upload(&offsets, stream)?,
+            d_n_r: DevBuf::upload(&n_r_vec, stream)?,
+            d_n_g: DevBuf::upload(&n_g_vec, stream)?,
             n_sources,
             h_orig_sizes,
-        })
+        };
+        // Block until all uploads finish so the staging Vecs above can be
+        // dropped safely. Ordering is on the same stream so the cost happens
+        // here at upload time, not on the per-iter hot path.
+        cuda_check(unsafe { cudaStreamSynchronize(stream) })?;
+        Ok(batch)
     }
 }
 
@@ -203,18 +297,30 @@ impl GpuBatchData {
 
 pub struct GpuContext {
     _device: i32,
+    /// Stream on which all CUDA work for this context is submitted. May be
+    /// null (default stream) for standalone usage. Lifetime is the caller's
+    /// responsibility — see [`Stream`].
+    stream: CudaStream,
 }
 
 
-// Safety: GpuContext is just a device ID. Each method calls cudaSetDevice
-// before any CUDA work, so it is safe to Send across threads.
+// Safety: GpuContext is a device ID plus a CUDA stream pointer. Each method
+// calls cudaSetDevice before any CUDA work, and stream submissions are
+// thread-safe, so it is safe to Send/Sync across threads.
 unsafe impl Send for GpuContext {}
 unsafe impl Sync for GpuContext {}
 
 impl GpuContext {
-    pub fn new(device: i32) -> Result<Self, String> {
+    /// Construct a context bound to `device`, submitting work on `stream`.
+    /// Pass `std::ptr::null_mut()` for the legacy default stream.
+    ///
+    /// # Safety
+    /// `stream` must be a valid `cudaStream_t` belonging to `device` (or null),
+    /// and must outlive this `GpuContext` and any [`GpuBatchData`] built from
+    /// it.
+    pub fn new(device: i32, stream: CudaStream) -> Result<Self, String> {
         cuda_check(unsafe { cudaSetDevice(device) })?;
-        Ok(Self { _device: device })
+        Ok(Self { _device: device, stream })
     }
 
     /// Bind the calling thread to this context's GPU device.
@@ -226,6 +332,11 @@ impl GpuContext {
     /// Device index for this context.
     pub fn device_id(&self) -> i32 {
         self._device
+    }
+
+    /// Raw `cudaStream_t` used by this context.
+    pub fn stream(&self) -> CudaStream {
+        self.stream
     }
 
     /// Run batch PSO for all sources simultaneously on the GPU.
@@ -242,6 +353,7 @@ impl GpuContext {
     ) -> Result<Vec<FitResult>, String> {
         // Ensure this thread is bound to the correct GPU device
         cuda_check(unsafe { cudaSetDevice(self._device) })?;
+        let stream = self.stream;
 
         let n_sources = data.n_sources;
         let dim = N_PARAMS;
@@ -254,9 +366,12 @@ impl GpuContext {
         let prior_means: Vec<f64> = priors.means.to_vec();
         let prior_stds: Vec<f64> = priors.stds.to_vec();
         let logged_mask: Vec<c_int> = priors.logged.iter().map(|&b| b as c_int).collect();
-        let d_prior_means = DevBuf::upload(&prior_means)?;
-        let d_prior_stds = DevBuf::upload(&prior_stds)?;
-        let d_logged_mask = DevBuf::upload(&logged_mask)?;
+        let d_prior_means = DevBuf::upload(&prior_means, stream)?;
+        let d_prior_stds = DevBuf::upload(&prior_stds, stream)?;
+        let d_logged_mask = DevBuf::upload(&logged_mask, stream)?;
+        // Block once so the staging Vecs above stay valid until the H2D
+        // copies finish; subsequent loop iterations sync per-iter anyway.
+        cuda_check(unsafe { cudaStreamSynchronize(stream) })?;
 
         // PSO bounds and velocity clamp (CPU-side only)
         let lower: [f64; N_PARAMS] = priors.mins;
@@ -333,7 +448,7 @@ impl GpuContext {
             let w = w_start - (w_start - w_end) * (iter as f64) * inv_max_iters;
 
             // 1. Upload positions, evaluate costs on GPU
-            d_positions.upload_from(&h_positions)?;
+            d_positions.upload_from(&h_positions, stream)?;
             unsafe {
                 launch_batch_pso_cost_villar_joint(
                     data.d_times.ptr as _, data.d_flux.ptr as _,
@@ -342,12 +457,13 @@ impl GpuContext {
                     d_positions.ptr as _, d_costs.ptr as _,
                     d_prior_means.ptr as _, d_prior_stds.ptr as _, d_logged_mask.ptr as _,
                     n_sources as c_int, n_particles as c_int,
-                    particle_grid, block,
+                    particle_grid, block, stream,
                 );
                 cuda_check(cudaGetLastError())?;
-                cuda_check(cudaDeviceSynchronize())?;
             }
-            d_costs.download_into(&mut h_costs)?;
+            d_costs.download_into(&mut h_costs, stream)?;
+            // Block until the D2H copy of h_costs lands before the CPU reads it.
+            cuda_check(unsafe { cudaStreamSynchronize(stream) })?;
 
             // 2. CPU: update personal bests, global bests, velocities, positions
             let mut all_done = true;

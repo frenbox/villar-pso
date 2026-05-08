@@ -1194,9 +1194,7 @@ mod python_bindings {
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     #[pyfunction]
     fn fit_gpu(csv_paths: &Bound<'_, pyo3::types::PyAny>) -> PyResult<PyObject> {
-        // Pick the backend module. Both expose identical types and methods,
-        // except `GpuBatchData::new` differs by one argument (Metal needs the
-        // context for buffer allocation; CUDA uses the implicit current device).
+        // Pick the backend module. Both expose identical types and methods.
         #[cfg(feature = "cuda")]
         use crate::gpu as backend;
         #[cfg(all(feature = "metal", target_os = "macos", not(feature = "cuda")))]
@@ -1235,14 +1233,20 @@ mod python_bindings {
         }
 
         let config = PsoConfig::default();
+        // CUDA: create a Stream so the Python entry point doesn't run on the
+        // legacy default stream. _stream is dropped at the end of this
+        // function — well after the GpuContext + GpuBatchData below.
+        #[cfg(feature = "cuda")]
+        let _stream = backend::Stream::new_on_device(0)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+        #[cfg(feature = "cuda")]
+        let gpu = GpuContext::new(0, _stream.as_ptr())
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+        #[cfg(all(feature = "metal", target_os = "macos", not(feature = "cuda")))]
         let gpu = GpuContext::new(0)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
 
         let source_data: Vec<&SourceData> = sources.iter().map(|(_, s)| s).collect();
-        #[cfg(feature = "cuda")]
-        let batch_data = GpuBatchData::new(&source_data)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
-        #[cfg(all(feature = "metal", target_os = "macos", not(feature = "cuda")))]
         let batch_data = GpuBatchData::new(&gpu, &source_data)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
         let results = gpu

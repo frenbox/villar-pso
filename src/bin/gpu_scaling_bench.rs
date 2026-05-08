@@ -8,7 +8,7 @@
 
 use std::time::Instant;
 use rayon::prelude::*;
-use villar_pso::gpu::{GpuBatchData, GpuContext, load_sources};
+use villar_pso::gpu::{GpuBatchData, GpuContext, Stream, load_sources};
 use villar_pso::PsoConfig;
 
 const CHUNK_SIZE: usize = 500;
@@ -46,9 +46,10 @@ fn main() {
 
     // Warmup: fit first chunk on GPU 0
     {
-        let gpu0 = GpuContext::new(0).expect("Failed to init GPU 0");
+        let stream0 = Stream::new_on_device(0).expect("create CUDA stream");
+        let gpu0 = GpuContext::new(0, stream0.as_ptr()).expect("Failed to init GPU 0");
         let warm = &sources[..CHUNK_SIZE.min(n_sources)];
-        let batch = GpuBatchData::new(warm).expect("GPU upload failed");
+        let batch = GpuBatchData::new(&gpu0, warm).expect("GPU upload failed");
         let _ = gpu0.batch_pso_multi_seed(&batch, warm, &config);
     }
 
@@ -64,9 +65,15 @@ fn main() {
     let gpu_counts = [1, 2, 3, 4, 5, 6, 7, 8];
 
     for &n_gpus in gpu_counts.iter().filter(|&&g| g <= n_gpus_max) {
-        // Create one GpuContext per GPU
-        let gpus: Vec<GpuContext> = (0..n_gpus as i32)
-            .map(|d| GpuContext::new(d).expect("Failed to init GPU"))
+        // Create one Stream + GpuContext per GPU. Streams must outlive the
+        // contexts; declare them first so they drop last.
+        let streams: Vec<Stream> = (0..n_gpus as i32)
+            .map(|d| Stream::new_on_device(d).expect("create CUDA stream"))
+            .collect();
+        let gpus: Vec<GpuContext> = streams
+            .iter()
+            .enumerate()
+            .map(|(i, s)| GpuContext::new(i as i32, s.as_ptr()).expect("Failed to init GPU"))
             .collect();
 
         // Rayon pool with one thread per GPU
@@ -88,7 +95,7 @@ fn main() {
                     // Bind this thread to the assigned GPU before allocating
                     gpu.set_device().expect("cudaSetDevice failed");
 
-                    let batch = GpuBatchData::new(chunk).expect("GPU upload failed");
+                    let batch = GpuBatchData::new(gpu, chunk).expect("GPU upload failed");
                     let results = gpu
                         .batch_pso_multi_seed(&batch, chunk, &config)
                         .expect("GPU batch PSO failed");
