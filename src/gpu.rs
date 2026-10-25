@@ -598,6 +598,7 @@ impl GpuContext {
                     params_mag: params.to_ab_mag(d.peak_flux),
                     peak_flux: d.peak_flux,
                     peak_mag: flux_to_mag(d.peak_flux, 0.0).0,
+                    t_peak: d.t_peak,
                     reduced_chi2: rchi2,
                     cost,
                     orig_size: d.orig_size,
