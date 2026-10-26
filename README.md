@@ -53,7 +53,9 @@ three scales:
 `beta` (fractional decline, day⁻¹), `gamma`, `t_0`, `tau_rise` and `tau_fall`
 (days) are the same in all three. `peak_flux` (µJy) has an AB counterpart
 `peak_mag`, and each entry of `fit()["obs"]` carries `mag` / `mag_err`
-alongside the normalised `flux` / `flux_err`.
+alongside the normalised `flux` / `flux_err`. `t_peak` is the time of the
+brightest r-band point, in the input time units: the phase `t_0` and the
+`obs` phases are counted from it.
 
 ```python
 r = villar_pso.fit("ZTF18aaaclwy.csv")

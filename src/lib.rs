@@ -604,7 +604,7 @@ fn finalize_preprocessing(mut obs: Vec<Obs>) -> Result<PreprocessedData, String>
         }
     }
 
-    Ok(PreprocessedData { obs, orig_size, peak_flux: peak })
+    Ok(PreprocessedData { obs, orig_size, peak_flux: peak, t_peak: t0 })
 }
 
 pub struct PreprocessedData {
@@ -612,6 +612,7 @@ pub struct PreprocessedData {
     pub orig_size: usize,
     /// Peak flux before normalisation (used to recover absolute-scale params).
     pub peak_flux: f64,
+    pub t_peak: f64,
 }
 
 // ─── Parameter map ───────────────────────────────────────────────────────────
@@ -1115,6 +1116,8 @@ pub struct FitResult {
     pub peak_flux: f64,
     /// `peak_flux` as an AB magnitude.
     pub peak_mag: f64,
+    /// Time of the brightest r-band point, where phase is zero (input time units).
+    pub t_peak: f64,
     /// Reduced chi-squared of the best fit.
     pub reduced_chi2: f64,
     /// Final objective ([`pso_cost`]) after the Nelder-Mead polish; lower is
@@ -1211,6 +1214,7 @@ fn fit_preprocessed(data: PreprocessedData) -> FitResult {
         params_mag: vp.to_ab_mag(data.peak_flux),
         peak_flux: data.peak_flux,
         peak_mag: flux_to_mag(data.peak_flux, 0.0).0,
+        t_peak: data.t_peak,
         reduced_chi2: rchi2,
         cost: best_cost,
         orig_size: data.orig_size,
@@ -1254,6 +1258,7 @@ mod python_bindings {
             dict.set_item("params_mag", params_mag)?;
             dict.set_item("peak_flux", result.peak_flux)?;
             dict.set_item("peak_mag", result.peak_mag)?;
+            dict.set_item("t_peak", result.t_peak)?;
             dict.set_item("reduced_chi2", result.reduced_chi2)?;
             dict.set_item("orig_size", result.orig_size)?;
 
@@ -1447,6 +1452,7 @@ mod python_bindings {
                     dict.set_item("params_mag", params_mag)?;
                     dict.set_item("peak_flux", res.peak_flux)?;
                     dict.set_item("peak_mag", res.peak_mag)?;
+                    dict.set_item("t_peak", res.t_peak)?;
                     dict.set_item("reduced_chi2", res.reduced_chi2)?;
                     out_list.append(dict)?;
                 }
